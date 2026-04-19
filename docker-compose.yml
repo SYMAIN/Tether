@@ -1,0 +1,11 @@
+services:
+    tether:
+        build: .
+        image: tether-agent
+        env_file: .env
+        stdin_open: true
+        tty: true
+        restart: always
+        volumes:
+            - ./token.json:/app/token.json
+            - ./credentials.json:/app/credentials.json
