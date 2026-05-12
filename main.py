@@ -1,15 +1,21 @@
 import os
 import datetime
 import discord
+import pytz
 from google import genai
 from google.genai import types
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-ALLOWED_CHANNEL = "tether"  # bot only responds in a channel named "tether"
+ALLOWED_CHANNEL = "tether"
+DEADLINE_PREFIX = "⏰"
+TORONTO_TZ = pytz.timezone("America/Toronto")
+DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
 
 
 # --- CALENDAR SETUP ---
@@ -42,8 +48,14 @@ def create_calendar_event(summary: str, start_time: str, end_time: str):
     return service.events().insert(calendarId="primary", body=event).execute()
 
 
+def delete_calendar_event(event_id: str):
+    """Deletes a calendar event by its event ID."""
+    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    return {"status": "deleted", "event_id": event_id}
+
+
 def list_upcoming_events(max_results: int = 20):
-    """Returns upcoming events to find free focus blocks."""
+    """Returns upcoming events to check the queue and find free slots."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     events_result = (
         service.events()
@@ -60,66 +72,125 @@ def list_upcoming_events(max_results: int = 20):
     return events_result.get("items", [])
 
 
+def get_tether_deadlines():
+    """Returns only Tether-managed ⏰ deadline events."""
+    return [
+        e
+        for e in list_upcoming_events(50)
+        if e.get("summary", "").startswith(DEADLINE_PREFIX)
+    ]
+
+
+def get_events_in_window(hours_from_now: int):
+    """Returns Tether deadlines within the next N hours."""
+    now = datetime.datetime.now(TORONTO_TZ)
+    cutoff = now + datetime.timedelta(hours=hours_from_now)
+    deadlines = []
+    for e in get_tether_deadlines():
+        start_str = e.get("start", {}).get("dateTime")
+        if not start_str:
+            continue
+        start = datetime.datetime.fromisoformat(start_str)
+        if start.tzinfo is None:
+            start = TORONTO_TZ.localize(start)
+        if now <= start <= cutoff:
+            deadlines.append(e)
+    return deadlines
+
+
+def get_overdue_tether_events():
+    """Returns Tether deadlines that ended before now."""
+    now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_local = datetime.datetime.now(TORONTO_TZ)
+    events_result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMax=now_utc,
+            maxResults=50,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    overdue = []
+    for e in events_result.get("items", []):
+        if not e.get("summary", "").startswith(DEADLINE_PREFIX):
+            continue
+        end_str = e.get("end", {}).get("dateTime")
+        if not end_str:
+            continue
+        end = datetime.datetime.fromisoformat(end_str)
+        if end.tzinfo is None:
+            end = TORONTO_TZ.localize(end)
+        # Only flag if it ended today
+        if end.date() == now_local.date():
+            overdue.append(e)
+    return overdue
+
+
 # --- GEMINI SETUP ---
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 with open("agent.md", "r") as f:
     instructions = f.read()
 
-
 MODELS = [
-    "gemini-3-flash-preview",  # Best — Pro-level reasoning at Flash speed
-    "gemini-3.1-pro-preview",  # Strongest reasoning, use as backup
-    "gemini-3.1-flash-lite-preview",  # Cost-efficient, good for high volume
-    "gemini-2.5-pro",  # Stable fallback
-    "gemini-2.5-flash",  # Stable, well tested
-    "gemini-2.5-flash-lite",  # Lightest stable option
-    "gemini-2.0-flash",  # Last resort (shuts down June 1, 2026)
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
 ]
 
 
+def get_next_sunday(from_date):
+    days_ahead = 6 - from_date.weekday()  # Sunday = 6
+    if days_ahead == 0:
+        days_ahead = 7
+    return from_date + datetime.timedelta(days=days_ahead)
+
+
 def get_chat(model=None):
-    today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-4)))
-    date_context = f"\n\n## Current Date & Time\nToday is {today.strftime('%A, %B %d, %Y')}. Current time is {today.strftime('%I:%M %p')} EDT."
+    today = datetime.datetime.now(TORONTO_TZ)
+    next_sunday = get_next_sunday(today)
+    date_context = (
+        f"\n\n## CURRENT DATE (DO NOT IGNORE)\n"
+        f"Today: {today.strftime('%A, %B %d, %Y')}\n"
+        f"Next Sunday: {next_sunday.strftime('%A, %B %d, %Y')}\n"
+        f"Default deadline date: {next_sunday.strftime('%B %d, %Y')} at 11:59 PM\n"
+        f"Default deadline ISO: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n\n"
+        f"When creating a deadline event, use EXACTLY this start and end time unless the user specifies otherwise:\n"
+        f"start_time: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n"
+        f"end_time: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n"
+    )
     return client.chats.create(
         model=model or MODELS[0],
         config=types.GenerateContentConfig(
             system_instruction=instructions + date_context,
-            tools=[create_calendar_event, list_upcoming_events],
+            tools=[create_calendar_event, delete_calendar_event, list_upcoming_events],
         ),
     )
 
 
 def send_with_fallback(chat, user_id, message_content):
     current_model_index = user_model_index.get(user_id, 0)
-
     for i in range(current_model_index, len(MODELS)):
         try:
-            # If we need to switch models, create a new chat
-            if i != current_model_index:
-                user_sessions[user_id] = get_chat(MODELS[i])
-                user_model_index[user_id] = i
-                chat = user_sessions[user_id]
-
+            chat = get_chat(MODELS[i])
+            user_sessions[user_id] = chat
+            user_model_index[user_id] = i
             response = chat.send_message(message_content)
-
-            # Reset to primary model after success if we had switched
             if i != 0:
                 user_model_index[user_id] = 0
                 user_sessions[user_id] = get_chat(MODELS[0])
-
             return response, MODELS[i]
-
         except Exception as e:
             if "503" in str(e) or "UNAVAILABLE" in str(e):
-                print(f"Model {MODELS[i]} unavailable, trying next...")
                 continue
             raise e
-
     raise Exception("All models are currently unavailable. Please try again later.")
 
 
-# One chat session per Discord user
 user_sessions = {}
 user_model_index = {}
 
@@ -129,9 +200,101 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
+async def dm_user(message: str):
+    user = await bot.fetch_user(DISCORD_USER_ID)
+    await user.send(message)
+
+
+# --- SCHEDULED JOBS ---
+async def morning_briefing():
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    events = list_upcoming_events(20)
+    today_events = [
+        e
+        for e in events
+        if e.get("start", {}).get("dateTime", "").startswith(str(today))
+    ]
+    if not today_events:
+        await dm_user("📅 **Morning briefing** — Nothing scheduled today.")
+        return
+    lines = ["📅 **Morning briefing — Today's schedule:**\n"]
+    for e in today_events:
+        start = e["start"]["dateTime"][11:16]
+        end = e["end"]["dateTime"][11:16]
+        lines.append(f"• {start}–{end} {e['summary']}")
+    await dm_user("\n".join(lines))
+
+
+async def eod_sweep():
+    overdue = get_overdue_tether_events()
+    for e in overdue:
+        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        await dm_user(
+            f"⚠️ **{name}** wasn't completed today. Keep it this Sunday or push back one week? Reply in #tether."
+        )
+
+
+async def deadline_warning():
+    upcoming = get_events_in_window(hours_from_now=24)
+    for e in upcoming:
+        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        due = e["start"]["dateTime"][11:16]
+        await dm_user(f"⏰ **Heads up:** {name} is due tomorrow at {due}.")
+
+
+async def weekly_queue_summary():
+    deadlines = get_tether_deadlines()
+    if not deadlines:
+        await dm_user("📋 **Weekly Queue** — No deadlines in the queue. You're clear.")
+        return
+    lines = ["📋 **Weekly Queue:**\n"]
+    for e in deadlines:
+        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        date_str = e["start"]["dateTime"][:10]
+        lines.append(f"• {name} — due {date_str}")
+    await dm_user("\n".join(lines))
+
+
 @bot.event
 async def on_ready():
     print(f"Tether is online as {bot.user}")
+    scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
+    scheduler.add_job(
+        morning_briefing, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+    )
+    scheduler.add_job(eod_sweep, CronTrigger(hour=22, minute=0, timezone=TORONTO_TZ))
+    scheduler.add_job(
+        deadline_warning, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+    )
+    scheduler.add_job(
+        weekly_queue_summary,
+        CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
+    )
+    scheduler.start()
+
+
+@bot.event
+async def on_ready():
+    print(f"Tether is online as {bot.user}")
+    scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
+
+    test_time = datetime.datetime.now(TORONTO_TZ) + datetime.timedelta(minutes=2)
+    trigger = CronTrigger(
+        hour=test_time.hour, minute=test_time.minute, timezone=TORONTO_TZ
+    )
+
+    scheduler.add_job(
+        morning_briefing, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+    )
+
+    scheduler.add_job(eod_sweep, CronTrigger(hour=22, minute=0, timezone=TORONTO_TZ))
+    scheduler.add_job(
+        deadline_warning, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+    )
+    scheduler.add_job(
+        weekly_queue_summary,
+        CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
+    )
 
 
 @bot.event
@@ -142,7 +305,6 @@ async def on_message(message):
         return
 
     user_id = message.author.id
-
     if user_id not in user_sessions:
         user_sessions[user_id] = get_chat(MODELS[0])
         user_model_index[user_id] = 0
@@ -153,30 +315,25 @@ async def on_message(message):
         try:
             response, model_used = send_with_fallback(chat, user_id, message.content)
 
-            text_parts = []
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, "text") and part.text:
-                    text_parts.append(part.text)
+            text_parts = [
+                part.text
+                for part in response.candidates[0].content.parts
+                if hasattr(part, "text") and part.text
+            ]
 
             if text_parts:
                 reply = "".join(text_parts)
             else:
                 follow_up = user_sessions[user_id].send_message(
-                    "Confirm what you just scheduled in a brief summary."
+                    "Confirm what you just did in one line."
                 )
                 reply = follow_up.text or "Done."
 
-            # Notify if fallback model was used
             if model_used != MODELS[0]:
-                reply = (
-                    f"⚠️ Primary model unavailable, using `{model_used}`.\n\n" + reply
-                )
+                reply = f"⚠️ Using fallback model `{model_used}`.\n\n" + reply
 
-            if len(reply) > 2000:
-                for i in range(0, len(reply), 2000):
-                    await message.channel.send(reply[i : i + 2000])
-            else:
-                await message.channel.send(reply)
+            for i in range(0, len(reply), 2000):
+                await message.channel.send(reply[i : i + 2000])
 
         except Exception as e:
             await message.channel.send(f"⚠️ {str(e)}")
