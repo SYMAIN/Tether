@@ -1,12 +1,75 @@
+````md
 # Tether
 
-A personal scheduling agent that converts natural language tasks into structured focus blocks on Google Calendar. Controlled via Discord, runs continuously in Docker.
+Tether is a personal scheduling and accountability agent that manages deadline queues through natural language.  
+It operates through Discord, runs continuously in Docker, and uses Google Calendar as the source of truth.
+
+Unlike traditional productivity systems, Tether does not manage focus sessions, task breakdowns, or execution strategy.
+
+Tether owns the **when** — you own the **how**.
 
 ---
 
-## Overview
+## Philosophy
 
-Tether uses Google Gemini's function calling API to read your existing calendar, decompose tasks into appropriately-sized work blocks, and schedule them around your commitments. It respects hard deadlines, avoids conflicts, and never modifies events you created manually.
+Tether is designed as a lightweight personal secretary:
+
+- Assigns and manages deadlines
+- Maintains a structured queue
+- Tracks postponed commitments
+- Follows up proactively
+- Preserves scheduling continuity
+
+It intentionally avoids:
+
+- Pomodoro systems
+- Habit tracking
+- Task decomposition
+- Gamification
+- Productivity coaching
+
+The goal is minimal overhead with persistent accountability.
+
+---
+
+## Core Behavior
+
+Tether manages tasks as a Sunday-based deadline queue.
+
+### Standard Tasks
+
+New tasks are assigned to the next available Sunday slot.
+
+### Urgent / ASAP Tasks
+
+Urgent tasks insert at the front of the queue and push existing deadlines back one week each.
+
+### Completing Tasks
+
+Completing a task removes it and pulls all remaining deadlines forward.
+
+### Missed Tasks
+
+Missed deadlines remain in place until explicitly pushed or completed.
+
+### Fixed Events
+
+Events created manually by the user are never modified.
+
+---
+
+## Features
+
+- Natural language scheduling through Discord mentions
+- Queue-based deadline management
+- Automatic Sunday deadline assignment
+- ASAP insertion with cascading queue shifts
+- Google Calendar integration
+- Metadata tracking for postponed tasks
+- Proactive morning and evening reminders
+- Deadline escalation behavior
+- Model fallback handling for Gemini API failures
+- Dockerized deployment with Windows auto-start support
 
 ---
 
@@ -22,32 +85,35 @@ Tether uses Google Gemini's function calling API to read your existing calendar,
 
 ---
 
-## Features
+## Architecture
 
-- Natural language task input via Discord
-- Automatic task decomposition into 60–90 min focus blocks
-- Conflict-aware scheduling against existing calendar events
-- Hard and soft deadline handling
-- Overflow scheduling into evenings and weekends when needed
-- Emoji-prefix system to distinguish agent-managed events from user events
-- Automatic model fallback on API unavailability
+Tether is intentionally lightweight:
+
+- Discord acts as the interaction layer
+- Google Calendar acts as the persistent state layer
+- Gemini handles natural language interpretation and scheduling decisions
+- Docker keeps the system continuously running
+
+No external database is required.
+
+Task metadata is embedded directly into Google Calendar event descriptions.
 
 ---
 
 ## Project Structure
 
-```
+```txt
 Tether/
-├── main.py              # Agent logic and Discord bot
-├── agent.md             # Scheduling rules and AI instructions
-├── requirements.txt     # Python dependencies
-├── dockerfile
+├── main.py              # Core bot logic
+├── agent.md             # System prompt and scheduling rules
+├── requirements.txt
+├── Dockerfile
 ├── docker-compose.yml
-├── .env                 # API keys — do not commit
-├── credentials.json     # Google OAuth credentials — do not commit
-├── token.json           # Google auth token — do not commit
-├── start.bat            # Windows start script
-└── stop.bat             # Windows stop script
+├── .env
+├── credentials.json
+├── token.json
+├── start.bat
+└── stop.bat
 ```
 
 ---
@@ -57,81 +123,146 @@ Tether/
 ### Prerequisites
 
 - Docker Desktop
+- Python 3.11
 - Google Cloud project with Calendar API enabled
-- Discord bot token from [discord.com/developers](https://discord.com/developers/applications)
-- Gemini API key from [Google AI Studio](https://aistudio.google.com)
+- Discord bot token
+- Gemini API key
 
-### Google Calendar Authentication
+---
 
-Run locally once to generate `token.json`:
+## Environment Variables
+
+```env
+GEMINI_API_KEY=your_key
+DISCORD_BOT_TOKEN=your_token
+DISCORD_USER_ID=your_discord_id
+```
+
+---
+
+## Google Calendar Authentication
+
+Generate `token.json` locally before running Docker:
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-### Environment Variables
+The OAuth client must be configured as:
 
-```env
-GEMINI_API_KEY=your_gemini_api_key
-DISCORD_BOT_TOKEN=your_discord_bot_token
+- Desktop Application
+- Google Calendar API enabled
+- `http://localhost:8080` added as an authorized redirect URI
+
+---
+
+## Discord Setup
+
+1. Create a bot application in Discord Developer Portal
+2. Enable:
+    - Message Content Intent
+3. Grant permissions:
+    - Send Messages
+    - Read Message History
+    - View Channels
+
+Tether responds when mentioned:
+
+```txt
+@Tether schedule circuits exam
+@Tether push lab report back one week
+@Tether completed deck renovation
 ```
 
-### Discord Bot Configuration
+---
 
-1. Create a new application at [discord.com/developers](https://discord.com/developers/applications)
-2. Enable **Message Content Intent** under Bot settings
-3. Grant permissions: `Send Messages`, `Read Message History`, `View Channels`
-4. Create a channel named `tether` in your server
-
-### Running
+## Running
 
 ```bash
-docker-compose up --build
+docker-compose up --build -d
+```
+
+For Windows startup automation:
+
+- Launch Docker Desktop first
+- Then execute `start.bat`
+- Task Scheduler should wait for Docker readiness before booting containers
+
+---
+
+## Example Interactions
+
+```txt
+@Tether schedule circuits exam
+→ Added. Circuits exam due Sun May 18.
+
+@Tether this is urgent — finish lab report
+→ ⚠️ Lab report moved to front. Bumped: Circuits exam → May 25.
+
+@Tether completed lab report
+→ Done. Circuits exam now due this Sunday.
 ```
 
 ---
 
-## Usage
+## Proactive Behaviors
 
-Send tasks naturally in the `#tether` channel:
+Tether can proactively DM:
 
-```
-Study for Circuits exam by Friday
-Finish lab report by tomorrow
-I'm busy Wednesday
-Build a Discord bot this week
-```
-
-Tether will confirm what it scheduled and flag any conflicts or warnings.
+- Morning schedule briefings
+- Upcoming deadline warnings
+- Weekly queue summaries
+- Overdue task follow-ups
+- Queue inactivity checks
 
 ---
 
-## Scheduling Behavior
+## Metadata Tracking
 
-- **Primary hours:** 9 AM – 6 PM weekdays
-- **Overflow:** 6:30 PM – 10 PM weekdays, 10 AM – 6 PM weekends
-- **Buffer:** 30 minutes between every focus block
-- **Hard deadlines:** Blocks scheduled backwards from the due date
-- **Soft deadlines:** Auto-assigned based on task complexity
-- **Fixed events** (no emoji prefix): never rescheduled or modified
+Tether embeds lightweight metadata directly inside calendar event descriptions:
 
-Agent-created events use emoji prefixes (`📚`, `⚙️`, `🔁`) to distinguish them from user events.
+```txt
+[TETHER_META]
+pushes=3
+created_at=2026-05-13
+last_modified=2026-05-20
+origin=asap_insert
+```
+
+This enables:
+
+- procrastination tracking
+- escalation behavior
+- continuity across sessions
+
+without requiring a database.
 
 ---
 
 ## Model Fallback
 
-On a 503 error, Tether tries models in this order:
+If Gemini fails or rate limits, Tether automatically retries using fallback models.
 
-```
-1. gemini-3-flash-preview
-2. gemini-3.1-pro-preview
-3. gemini-3.1-flash-lite-preview
-4. gemini-2.5-pro
-5. gemini-2.5-flash
-6. gemini-2.5-flash-lite
-7. gemini-2.0-flash
+Current fallback chain:
+
+```txt
+1. gemini-2.5-pro
+2. gemini-2.5-flash
+3. gemini-2.5-flash-lite
+4. gemini-2.0-flash
 ```
 
 ---
+
+## Design Principles
+
+- Deadlines over micromanagement
+- Queue continuity over optimization
+- Minimal friction
+- Stateless conversations
+- Calendar as source of truth
+- Accountability over motivation
+
+---
+````

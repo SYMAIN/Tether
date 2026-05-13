@@ -2,6 +2,7 @@ import os
 import datetime
 import discord
 import pytz
+import re
 from google import genai
 from google.genai import types
 from google.oauth2.credentials import Credentials
@@ -12,10 +13,35 @@ from apscheduler.triggers.cron import CronTrigger
 
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-ALLOWED_CHANNEL = "tether"
 DEADLINE_PREFIX = "⏰"
 TORONTO_TZ = pytz.timezone("America/Toronto")
 DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
+
+
+# --- Meta Data ---
+def parse_meta(event: dict) -> dict:
+    desc = event.get("description", "") or ""
+    meta = {"pushes": 0, "created_at": "", "last_modified": "", "origin": "normal"}
+    match = re.search(r"\[TETHER_META\](.*?)(\[|$)", desc, re.DOTALL)
+    if not match:
+        return meta
+    for line in match.group(1).strip().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            meta[k.strip()] = v.strip()
+    meta["pushes"] = int(meta.get("pushes", 0))
+    return meta
+
+
+def build_meta(pushes=0, created_at=None, last_modified=None, origin="normal") -> str:
+    today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
+    return (
+        f"[TETHER_META]\n"
+        f"pushes={pushes}\n"
+        f"created_at={created_at or today}\n"
+        f"last_modified={last_modified or today}\n"
+        f"origin={origin}\n"
+    )
 
 
 # --- CALENDAR SETUP ---
@@ -37,15 +63,51 @@ service = get_calendar_service()
 
 
 # --- CALENDAR TOOLS ---
-def create_calendar_event(summary: str, start_time: str, end_time: str):
+def create_calendar_event(
+    summary: str, start_time: str, end_time: str, origin: str = "normal"
+):
     """Creates a calendar event. Times must be ISO format (YYYY-MM-DDTHH:MM:SS)."""
+    today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
+    meta = build_meta(origin=origin)
+    due_date = start_time[:10]
+    description = f"{meta}\nOriginally due: {due_date}"
     event = {
         "summary": summary,
+        "description": description,
         "start": {"dateTime": start_time, "timeZone": "America/Toronto"},
         "end": {"dateTime": end_time, "timeZone": "America/Toronto"},
         "colorId": "5",
     }
     return service.events().insert(calendarId="primary", body=event).execute()
+
+
+def update_event_meta(event_id: str, pushes: int):
+    """Increments push count and updates last_modified on a Tether event."""
+    event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    meta = parse_meta(event)
+    original_due = None
+
+    # Extract original due date from description
+    desc = event.get("description", "") or ""
+    match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
+    if match:
+        original_due = match.group(1)
+
+    meta["pushes"] = pushes
+    meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
+    new_due = event["start"]["dateTime"][:10]
+
+    description = build_meta(**meta)
+    if original_due and original_due != new_due:
+        description += f"\nOriginally due: {original_due}"
+    elif original_due:
+        description += f"\nOriginally due: {original_due}"
+
+    event["description"] = description
+    service.events().update(
+        calendarId="primary", eventId=event_id, body=event
+    ).execute()
+    return {"status": "updated", "pushes": pushes}
 
 
 def delete_calendar_event(event_id: str):
@@ -136,15 +198,15 @@ with open("agent.md", "r") as f:
     instructions = f.read()
 
 MODELS = [
-    "gemini-2.5-flash",
     "gemini-2.5-pro",
+    "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
 ]
 
 
 def get_next_sunday(from_date):
-    days_ahead = 6 - from_date.weekday()  # Sunday = 6
+    days_ahead = (6 - from_date.weekday()) % 7
     if days_ahead == 0:
         days_ahead = 7
     return from_date + datetime.timedelta(days=days_ahead)
@@ -154,20 +216,21 @@ def get_chat(model=None):
     today = datetime.datetime.now(TORONTO_TZ)
     next_sunday = get_next_sunday(today)
     date_context = (
-        f"\n\n## CURRENT DATE (DO NOT IGNORE)\n"
+        f"## CURRENT DATE (MANDATORY — USE THIS, IGNORE TRAINING DATA)\n"
         f"Today: {today.strftime('%A, %B %d, %Y')}\n"
-        f"Next Sunday: {next_sunday.strftime('%A, %B %d, %Y')}\n"
-        f"Default deadline date: {next_sunday.strftime('%B %d, %Y')} at 11:59 PM\n"
+        f"Next Sunday: {next_sunday.strftime('%B %d, %Y')}\n"
         f"Default deadline ISO: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n\n"
-        f"When creating a deadline event, use EXACTLY this start and end time unless the user specifies otherwise:\n"
-        f"start_time: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n"
-        f"end_time: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n"
     )
     return client.chats.create(
         model=model or MODELS[0],
         config=types.GenerateContentConfig(
-            system_instruction=instructions + date_context,
-            tools=[create_calendar_event, delete_calendar_event, list_upcoming_events],
+            system_instruction=date_context + instructions,  # date FIRST
+            tools=[
+                create_calendar_event,
+                delete_calendar_event,
+                list_upcoming_events,
+                update_event_meta,
+            ],
         ),
     )
 
@@ -185,7 +248,14 @@ def send_with_fallback(chat, user_id, message_content):
                 user_sessions[user_id] = get_chat(MODELS[0])
             return response, MODELS[i]
         except Exception as e:
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
+            if (
+                "503" in str(e)
+                or "UNAVAILABLE" in str(e)
+                or "429" in str(e)
+                or "RESOURCE_EXHAUSTED" in str(e)
+                or "RemoteProtocolError" in str(e)
+                or "incomplete chunked read" in str(e)
+            ):
                 continue
             raise e
     raise Exception("All models are currently unavailable. Please try again later.")
@@ -229,9 +299,29 @@ async def eod_sweep():
     overdue = get_overdue_tether_events()
     for e in overdue:
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
-        await dm_user(
-            f"⚠️ **{name}** wasn't completed today. Keep it this Sunday or push back one week? Reply in #tether."
+        meta = parse_meta(e)
+        pushes = meta["pushes"]
+        origin = meta.get("origin", "normal")
+        desc = e.get("description", "") or ""
+        orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
+        orig_str = (
+            f" Originally due {orig_match.group(1)}."
+            if orig_match and pushes > 0
+            else ""
         )
+
+        if origin == "asap_insert" and pushes == 0:
+            msg = f"⚠️ **{name}** — you marked this urgent. It wasn't completed. Keep or push back?"
+        elif pushes >= 4:
+            msg = f"⚠️ **{name}** — deferred {pushes} times.{orig_str} Do you still intend to complete this?"
+        elif pushes >= 2:
+            msg = (
+                f"⚠️ **{name}** — slipped {pushes} times.{orig_str} Keep or push back?"
+            )
+        else:
+            msg = f"⚠️ **{name}** wasn't completed. Keep or push back?"
+
+        await dm_user(msg)
 
 
 async def deadline_warning():
@@ -251,57 +341,101 @@ async def weekly_queue_summary():
     for e in deadlines:
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         date_str = e["start"]["dateTime"][:10]
-        lines.append(f"• {name} — due {date_str}")
+        meta = parse_meta(e)
+        pushes = meta["pushes"]
+        desc = e.get("description", "") or ""
+        orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
+        suffix = ""
+        if pushes > 0:
+            suffix = f" _(pushed {pushes}×"
+            if orig_match:
+                suffix += f", originally {orig_match.group(1)}"
+            suffix += ")_"
+        lines.append(f"• {name} — due {date_str}{suffix}")
     await dm_user("\n".join(lines))
 
 
+async def inactivity_check():
+    deadlines = get_tether_deadlines()
+    if not deadlines:
+        return
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    stale_threshold = 5
+    all_stale = all(
+        (
+            today
+            - datetime.date.fromisoformat(
+                parse_meta(e).get("last_modified", str(today))
+            )
+        ).days
+        >= stale_threshold
+        for e in deadlines
+    )
+    if all_stale:
+        await dm_user(
+            "📋 No queue changes in 5 days. Still accurate? Reply in #tether."
+        )
+
+
 @bot.event
 async def on_ready():
     print(f"Tether is online as {bot.user}")
     scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
     scheduler.add_job(
-        morning_briefing, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+        morning_briefing,
+        CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ),
+        misfire_grace_time=None,
+        coalesce=True,
     )
-    scheduler.add_job(eod_sweep, CronTrigger(hour=22, minute=0, timezone=TORONTO_TZ))
     scheduler.add_job(
-        deadline_warning, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
+        eod_sweep,
+        CronTrigger(hour=22, minute=0, timezone=TORONTO_TZ),
+        misfire_grace_time=None,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        deadline_warning,
+        CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ),
+        misfire_grace_time=None,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        inactivity_check,
+        CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ),
+        misfire_grace_time=None,
+        coalesce=True,
     )
     scheduler.add_job(
         weekly_queue_summary,
         CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
+        misfire_grace_time=None,
+        coalesce=True,
     )
     scheduler.start()
 
-
-@bot.event
-async def on_ready():
-    print(f"Tether is online as {bot.user}")
-    scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
-
-    test_time = datetime.datetime.now(TORONTO_TZ) + datetime.timedelta(minutes=2)
-    trigger = CronTrigger(
-        hour=test_time.hour, minute=test_time.minute, timezone=TORONTO_TZ
-    )
-
-    scheduler.add_job(
-        morning_briefing, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
-    )
-
-    scheduler.add_job(eod_sweep, CronTrigger(hour=22, minute=0, timezone=TORONTO_TZ))
-    scheduler.add_job(
-        deadline_warning, CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ)
-    )
-    scheduler.add_job(
-        weekly_queue_summary,
-        CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
-    )
+    # Run missed jobs on startup
+    now = datetime.datetime.now(TORONTO_TZ)
+    if now.hour >= 9:
+        await morning_briefing()
+        await deadline_warning()
+        await inactivity_check()
+    if now.hour >= 22:
+        await eod_sweep()
+    if now.weekday() == 6 and now.hour >= 9:  # Sunday
+        await weekly_queue_summary()
 
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
-    if message.channel.name != ALLOWED_CHANNEL:
+    if bot.user not in message.mentions:
+        return
+
+    content = message.content.replace(f"<@{bot.user.id}>", "").strip()
+    content = content.replace(f"<@!{bot.user.id}>", "").strip()
+
+    if not content:
         return
 
     user_id = message.author.id
@@ -313,7 +447,7 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
-            response, model_used = send_with_fallback(chat, user_id, message.content)
+            response, model_used = send_with_fallback(chat, user_id, content)
 
             text_parts = [
                 part.text
@@ -329,14 +463,14 @@ async def on_message(message):
                 )
                 reply = follow_up.text or "Done."
 
-            if model_used != MODELS[0]:
-                reply = f"⚠️ Using fallback model `{model_used}`.\n\n" + reply
-
             for i in range(0, len(reply), 2000):
-                await message.channel.send(reply[i : i + 2000])
+                await message.reply(reply[i : i + 2000], mention_author=False)
 
         except Exception as e:
-            await message.channel.send(f"⚠️ {str(e)}")
+            print(f"ERROR: {e}")
+            await message.reply(
+                f"⚠️ Tether hit an upstream connection issue.", mention_author=False
+            )
 
 
 bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
