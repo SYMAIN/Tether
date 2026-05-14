@@ -1,4 +1,5 @@
 import os
+import json
 import datetime
 import discord
 import pytz
@@ -18,8 +19,17 @@ TORONTO_TZ = pytz.timezone("America/Toronto")
 DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
 LOG_FILE = "tether.log"
 
+MODELS = [
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+]
 
-# --- Meta Data ---
+CONFIDENCE_THRESHOLD = 0.7
+
+
+# --- META ---
 def parse_meta(event: dict) -> dict:
     desc = event.get("description", "") or ""
     meta = {"pushes": 0, "created_at": "", "last_modified": "", "origin": "normal"}
@@ -74,7 +84,6 @@ def create_calendar_event(
     summary: str, start_time: str, end_time: str, origin: str = "normal"
 ):
     """Creates a calendar event. Times must be ISO format (YYYY-MM-DDTHH:MM:SS)."""
-    today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = build_meta(origin=origin)
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
@@ -92,23 +101,16 @@ def update_event_meta(event_id: str, pushes: int):
     """Increments push count and updates last_modified on a Tether event."""
     event = service.events().get(calendarId="primary", eventId=event_id).execute()
     meta = parse_meta(event)
-    original_due = None
-
-    # Extract original due date from description
     desc = event.get("description", "") or ""
-    match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
-    if match:
-        original_due = match.group(1)
+    orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
+    original_due = orig_match.group(1) if orig_match else None
 
     meta["pushes"] = pushes
     meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     new_due = event["start"]["dateTime"][:10]
 
     description = build_meta(**meta)
-    if original_due and original_due != new_due:
-        description += f"\nOriginally due: {original_due}"
-    elif original_due:
-        description += f"\nOriginally due: {original_due}"
+    description += f"\nOriginally due: {original_due or new_due}"
 
     event["description"] = description
     service.events().update(
@@ -126,7 +128,7 @@ def delete_calendar_event(event_id: str):
 def list_upcoming_events(max_results: int = 20):
     """Returns upcoming events to check the queue and find free slots."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    events_result = (
+    result = (
         service.events()
         .list(
             calendarId="primary",
@@ -138,7 +140,7 @@ def list_upcoming_events(max_results: int = 20):
         )
         .execute()
     )
-    return events_result.get("items", [])
+    return result.get("items", [])
 
 
 def get_tether_deadlines():
@@ -168,10 +170,10 @@ def get_events_in_window(hours_from_now: int):
 
 
 def get_overdue_tether_events():
-    """Returns Tether deadlines that ended before now."""
+    """Returns Tether deadlines that ended today before now."""
     now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
     now_local = datetime.datetime.now(TORONTO_TZ)
-    events_result = (
+    result = (
         service.events()
         .list(
             calendarId="primary",
@@ -183,7 +185,7 @@ def get_overdue_tether_events():
         .execute()
     )
     overdue = []
-    for e in events_result.get("items", []):
+    for e in result.get("items", []):
         if not e.get("summary", "").startswith(DEADLINE_PREFIX):
             continue
         end_str = e.get("end", {}).get("dateTime")
@@ -192,7 +194,6 @@ def get_overdue_tether_events():
         end = datetime.datetime.fromisoformat(end_str)
         if end.tzinfo is None:
             end = TORONTO_TZ.localize(end)
-        # Only flag if it ended today
         if end.date() == now_local.date():
             overdue.append(e)
     return overdue
@@ -212,20 +213,88 @@ def complete_task(event_id: str):
     }
 
 
-# --- GEMINI SETUP ---
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# --- INTENT PARSER ---
+gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 with open("agent.md", "r") as f:
-    instructions = f.read()
+    AGENT_INSTRUCTIONS = f.read()
 
-MODELS = [
-    "gemini-2.5-pro",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
-]
+INTENT_PARSER_PROMPT = f"""You are an intent parser for a personal scheduling agent called Tether.
+Convert the user's message into a structured JSON command. Output ONLY the JSON object — no preamble, no markdown fences.
+
+Schema:
+{{
+  "action": "schedule" | "push" | "complete" | "delete" | "list" | "clarify",
+  "task_title": string | null,
+  "urgency": "normal" | "asap",
+  "target_date": "YYYY-MM-DD" | null,
+  "delta_days": integer | null,
+  "confidence": float (0.0–1.0),
+  "needs_clarification": boolean,
+  "clarification_question": string | null
+}}
+
+Rules:
+- action "schedule": user wants to add a task with a deadline
+- action "push": user wants to delay a task (delta_days = number of days, or 7 for "one week / next week")
+- action "complete": user says they finished something
+- action "delete": user wants to remove a task without marking it complete
+- action "list": user wants to see the queue
+- action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
+- urgency "asap": only if user says urgent / ASAP / emergency / as soon as possible
+- target_date: nearest future date matching what the user said (e.g. "by Friday" → next Friday as YYYY-MM-DD); null if not given
+- delta_days: for push only; null otherwise
+- needs_clarification: true if confidence < {CONFIDENCE_THRESHOLD} OR action is ambiguous
+- clarification_question: single concise question to resolve ambiguity; null if needs_clarification is false
+- "I'm busy [day]" → action "push", task_title null, delta_days null (scheduler will handle day-specific logic)
+- Never invent a deadline the user did not provide
+- Current date: {{date}}
+"""
 
 
+def build_intent_prompt() -> str:
+    today = datetime.datetime.now(TORONTO_TZ).strftime("%A, %B %d, %Y")
+    return INTENT_PARSER_PROMPT.replace("{date}", today)
+
+
+def parse_intent(user_message: str, model: str) -> dict:
+    response = gemini_client.models.generate_content(
+        model=model,
+        config=types.GenerateContentConfig(system_instruction=build_intent_prompt()),
+        contents=user_message,
+    )
+    raw = (
+        response.text.strip()
+        .removeprefix("```json")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
+    return json.loads(raw)
+
+
+def parse_intent_with_fallback(user_message: str) -> tuple[dict, str]:
+    for model in MODELS:
+        try:
+            return parse_intent(user_message, model), model
+        except Exception as e:
+            if any(
+                code in str(e)
+                for code in [
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "RemoteProtocolError",
+                    "incomplete chunked read",
+                ]
+            ):
+                continue
+            raise
+    raise Exception("All models are currently unavailable. Please try again later.")
+
+
+# --- SCHEDULER SESSION ---
 def get_next_sunday(from_date):
     days_ahead = (6 - from_date.weekday()) % 7
     if days_ahead == 0:
@@ -233,7 +302,7 @@ def get_next_sunday(from_date):
     return from_date + datetime.timedelta(days=days_ahead)
 
 
-def get_chat(model=None):
+def get_scheduler_chat(model=None):
     today = datetime.datetime.now(TORONTO_TZ)
     next_sunday = get_next_sunday(today)
     date_context = (
@@ -242,10 +311,10 @@ def get_chat(model=None):
         f"Next Sunday: {next_sunday.strftime('%B %d, %Y')}\n"
         f"Default deadline ISO: {next_sunday.strftime('%Y-%m-%d')}T23:59:00\n\n"
     )
-    return client.chats.create(
+    return gemini_client.chats.create(
         model=model or MODELS[0],
         config=types.GenerateContentConfig(
-            system_instruction=date_context + instructions,  # date FIRST
+            system_instruction=date_context + AGENT_INSTRUCTIONS,
             tools=[
                 create_calendar_event,
                 delete_calendar_event,
@@ -257,19 +326,30 @@ def get_chat(model=None):
     )
 
 
-def send_with_fallback(chat, user_id, message_content):
-    current_model_index = user_model_index.get(user_id, 0)
-    for i in range(current_model_index, len(MODELS)):
+user_sessions: dict = {}
+user_model_index: dict = {}
+pending_clarifications: dict[int, str] = {}  # user_id → message awaiting clarification
+
+
+def get_or_create_session(user_id: int):
+    if user_id not in user_sessions:
+        user_sessions[user_id] = get_scheduler_chat(MODELS[0])
+        user_model_index[user_id] = 0
+    return user_sessions[user_id]
+
+
+def send_with_fallback(chat, user_id: int, message_content: str):
+    current_index = user_model_index.get(user_id, 0)
+    for i in range(current_index, len(MODELS)):
         try:
-            if i != current_model_index:
-                # Switching models — new session unavoidable
-                chat = get_chat(MODELS[i])
+            if i != current_index:
+                chat = get_scheduler_chat(MODELS[i])
                 user_sessions[user_id] = chat
                 user_model_index[user_id] = i
             response = chat.send_message(message_content)
             if i != 0:
                 user_model_index[user_id] = 0
-                user_sessions[user_id] = get_chat(MODELS[0])
+                user_sessions[user_id] = get_scheduler_chat(MODELS[0])
             return response, MODELS[i]
         except Exception as e:
             if any(
@@ -284,12 +364,21 @@ def send_with_fallback(chat, user_id, message_content):
                 ]
             ):
                 continue
-            raise e
+            raise
     raise Exception("All models are currently unavailable. Please try again later.")
 
 
-user_sessions = {}
-user_model_index = {}
+def extract_reply(response, chat) -> str:
+    text_parts = [
+        part.text
+        for part in response.candidates[0].content.parts
+        if hasattr(part, "text") and part.text
+    ]
+    if text_parts:
+        return "".join(text_parts)
+    follow_up = chat.send_message("Confirm what you just did in one line.")
+    return follow_up.text or "Done."
+
 
 # --- DISCORD BOT ---
 intents = discord.Intents.default()
@@ -454,7 +543,6 @@ async def on_ready():
     )
     scheduler.start()
 
-    # Run missed jobs on startup
     now = datetime.datetime.now(TORONTO_TZ)
     if now.hour >= 9 and not await already_dmed_today("Morning briefing"):
         await morning_briefing()
@@ -477,45 +565,48 @@ async def on_message(message):
     if bot.user not in message.mentions:
         return
 
-    content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-    content = content.replace(f"<@!{bot.user.id}>", "").strip()
-
+    content = (
+        message.content.replace(f"<@{bot.user.id}>", "")
+        .replace(f"<@!{bot.user.id}>", "")
+        .strip()
+    )
     if not content:
         return
 
     user_id = message.author.id
-    if user_id not in user_sessions:
-        user_sessions[user_id] = get_chat(MODELS[0])
-        user_model_index[user_id] = 0
-
-    chat = user_sessions[user_id]
 
     async with message.channel.typing():
         try:
-            response, model_used = send_with_fallback(chat, user_id, content)
+            # Resolve pending clarification
+            if user_id in pending_clarifications:
+                original = pending_clarifications.pop(user_id)
+                content = f"{original} — clarification: {content}"
 
-            text_parts = [
-                part.text
-                for part in response.candidates[0].content.parts
-                if hasattr(part, "text") and part.text
-            ]
+            command, _ = parse_intent_with_fallback(content)
+            log(f"[INTENT] {message.author}: {json.dumps(command)}")
 
-            if text_parts:
-                reply = "".join(text_parts)
-            else:
-                follow_up = user_sessions[user_id].send_message(
-                    "Confirm what you just did in one line."
-                )
-                reply = follow_up.text or "Done."
+            if command.get("needs_clarification"):
+                pending_clarifications[user_id] = content
+                question = command.get("clarification_question", "Could you clarify?")
+                await message.reply(f"❓ {question}", mention_author=False)
+                return
 
+            # Pass structured intent to scheduler session
+            chat = get_or_create_session(user_id)
+            scheduler_prompt = (
+                f"[PARSED INTENT] {json.dumps(command)}\n\nOriginal message: {content}"
+            )
+            response, _ = send_with_fallback(chat, user_id, scheduler_prompt)
+            reply = extract_reply(response, chat)
+
+            log(f"[REPLY to {message.author}] {reply[:200]}")
             for i in range(0, len(reply), 2000):
-                log(f"[REPLY to {message.author}] {reply[:200]}")
                 await message.reply(reply[i : i + 2000], mention_author=False)
 
         except Exception as e:
             print(f"ERROR: {e}")
             await message.reply(
-                f"⚠️ Tether hit an upstream connection issue.", mention_author=False
+                "⚠️ Tether hit an upstream connection issue.", mention_author=False
             )
 
 
