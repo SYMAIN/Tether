@@ -1,4 +1,3 @@
-````md
 # Tether
 
 Tether is a personal scheduling and accountability agent that manages deadline queues through natural language.  
@@ -265,4 +264,3 @@ Current fallback chain:
 - Accountability over motivation
 
 ---
-````
