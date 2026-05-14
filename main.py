@@ -16,6 +16,7 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 DEADLINE_PREFIX = "⏰"
 TORONTO_TZ = pytz.timezone("America/Toronto")
 DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
+LOG_FILE = "tether.log"
 
 
 # --- Meta Data ---
@@ -42,6 +43,12 @@ def build_meta(pushes=0, created_at=None, last_modified=None, origin="normal") -
         f"last_modified={last_modified or today}\n"
         f"origin={origin}\n"
     )
+
+
+def log(entry: str):
+    timestamp = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d %H:%M")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{timestamp}] {entry}\n")
 
 
 # --- CALENDAR SETUP ---
@@ -191,6 +198,20 @@ def get_overdue_tether_events():
     return overdue
 
 
+def complete_task(event_id: str):
+    """Marks a Tether deadline as done and signals the queue to advance."""
+    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    remaining = get_tether_deadlines()
+    return {
+        "status": "completed",
+        "event_id": event_id,
+        "remaining_queue": [
+            {"id": e["id"], "summary": e["summary"], "due": e["start"]["dateTime"]}
+            for e in remaining
+        ],
+    }
+
+
 # --- GEMINI SETUP ---
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -230,6 +251,7 @@ def get_chat(model=None):
                 delete_calendar_event,
                 list_upcoming_events,
                 update_event_meta,
+                complete_task,
             ],
         ),
     )
@@ -239,22 +261,27 @@ def send_with_fallback(chat, user_id, message_content):
     current_model_index = user_model_index.get(user_id, 0)
     for i in range(current_model_index, len(MODELS)):
         try:
-            chat = get_chat(MODELS[i])
-            user_sessions[user_id] = chat
-            user_model_index[user_id] = i
+            if i != current_model_index:
+                # Switching models — new session unavoidable
+                chat = get_chat(MODELS[i])
+                user_sessions[user_id] = chat
+                user_model_index[user_id] = i
             response = chat.send_message(message_content)
             if i != 0:
                 user_model_index[user_id] = 0
                 user_sessions[user_id] = get_chat(MODELS[0])
             return response, MODELS[i]
         except Exception as e:
-            if (
-                "503" in str(e)
-                or "UNAVAILABLE" in str(e)
-                or "429" in str(e)
-                or "RESOURCE_EXHAUSTED" in str(e)
-                or "RemoteProtocolError" in str(e)
-                or "incomplete chunked read" in str(e)
+            if any(
+                code in str(e)
+                for code in [
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "RemoteProtocolError",
+                    "incomplete chunked read",
+                ]
             ):
                 continue
             raise e
@@ -273,6 +300,7 @@ bot = discord.Client(intents=intents)
 async def dm_user(message: str):
     user = await bot.fetch_user(DISCORD_USER_ID)
     await user.send(message)
+    log(f"[DM] {message[:200]}")
 
 
 # --- SCHEDULED JOBS ---
@@ -377,6 +405,19 @@ async def inactivity_check():
         )
 
 
+async def already_dmed_today(keyword: str) -> bool:
+    user = await bot.fetch_user(DISCORD_USER_ID)
+    dm = await user.create_dm()
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    async for msg in dm.history(limit=50):
+        msg_date = msg.created_at.astimezone(TORONTO_TZ).date()
+        if msg_date < today:
+            break
+        if msg.author == bot.user and keyword in msg.content:
+            return True
+    return False
+
+
 @bot.event
 async def on_ready():
     print(f"Tether is online as {bot.user}")
@@ -415,13 +456,17 @@ async def on_ready():
 
     # Run missed jobs on startup
     now = datetime.datetime.now(TORONTO_TZ)
-    if now.hour >= 9:
+    if now.hour >= 9 and not await already_dmed_today("Morning briefing"):
         await morning_briefing()
         await deadline_warning()
         await inactivity_check()
-    if now.hour >= 22:
+    if now.hour >= 22 and not await already_dmed_today("wasn't completed"):
         await eod_sweep()
-    if now.weekday() == 6 and now.hour >= 9:  # Sunday
+    if (
+        now.weekday() == 6
+        and now.hour >= 9
+        and not await already_dmed_today("Weekly Queue")
+    ):
         await weekly_queue_summary()
 
 
@@ -464,6 +509,7 @@ async def on_message(message):
                 reply = follow_up.text or "Done."
 
             for i in range(0, len(reply), 2000):
+                log(f"[REPLY to {message.author}] {reply[:200]}")
                 await message.reply(reply[i : i + 2000], mention_author=False)
 
         except Exception as e:

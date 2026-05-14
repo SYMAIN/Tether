@@ -59,11 +59,15 @@ Before adding ANY task you MUST map the existing queue first.
 - Insert at the correct position in the queue based on date order
 - Bump everything after it back one Sunday each
 
-### Completing a task
+## Task Completion
 
-- Delete the event
-- Pull every remaining ⏰ task forward one Sunday
-  → "Done. [Next Task] now due this Sunday."
+When a user marks a task as done:
+
+1. Call complete_task with the event ID
+2. The tool returns the remaining queue
+3. Immediately call list_upcoming_events
+4. Identify the next ⏰ deadline — if it has no focus blocks scheduled before it, proactively schedule them now
+5. Confirm to the user: what was completed, what's next, and what you just scheduled
 
 ### Missing a task (deadline passed, not done)
 

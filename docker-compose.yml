@@ -9,3 +9,4 @@ services:
         volumes:
             - ./token.json:/app/token.json
             - ./credentials.json:/app/credentials.json
+            - ./tether.log:/app/tether.log
