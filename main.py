@@ -213,6 +213,120 @@ def complete_task(event_id: str):
     }
 
 
+# --- PRIORITY ENGINE ---
+COMPLEXITY_HIGH = [
+    "exam",
+    "final",
+    "midterm",
+    "thesis",
+    "dissertation",
+    "project",
+    "build",
+    "app",
+    "bot",
+    "feature",
+    "system",
+    "redesign",
+    "research",
+]
+COMPLEXITY_MED = [
+    "report",
+    "essay",
+    "assignment",
+    "lab",
+    "presentation",
+    "study",
+    "review",
+    "analysis",
+    "proposal",
+]
+COMPLEXITY_LOW = [
+    "email",
+    "reply",
+    "read",
+    "watch",
+    "call",
+    "meeting",
+    "form",
+    "submit",
+]
+
+
+def infer_complexity(task_title: str) -> int:
+    title = task_title.lower()
+    if any(w in title for w in COMPLEXITY_HIGH):
+        return 3
+    if any(w in title for w in COMPLEXITY_MED):
+        return 2
+    return 1
+
+
+def priority_score(event: dict) -> float:
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    meta = parse_meta(event)
+    pushes = meta["pushes"]
+
+    due_str = event.get("start", {}).get("dateTime", "")[:10]
+    try:
+        due_date = datetime.date.fromisoformat(due_str)
+        days_until = max((due_date - today).days, 0)
+    except ValueError:
+        days_until = 999
+
+    name = (
+        event.get("summary", "")
+        .replace(DEADLINE_PREFIX, "")
+        .replace("— DUE", "")
+        .strip()
+    )
+    complexity = infer_complexity(name)
+
+    # Lower score = higher priority
+    return days_until - (complexity * 2) - (pushes * 1.5)
+
+
+def rank_deadlines(deadlines: list) -> list:
+    return sorted(deadlines, key=priority_score)
+
+
+def complexity_label(score: int) -> str:
+    return {3: "high complexity", 2: "medium complexity", 1: "quick task"}.get(
+        score, "unknown"
+    )
+
+
+def priority_reason(event: dict) -> str:
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    meta = parse_meta(event)
+    pushes = meta["pushes"]
+    name = (
+        event.get("summary", "")
+        .replace(DEADLINE_PREFIX, "")
+        .replace("— DUE", "")
+        .strip()
+    )
+    due_str = event.get("start", {}).get("dateTime", "")[:10]
+
+    try:
+        due_date = datetime.date.fromisoformat(due_str)
+        days_until = (due_date - today).days
+    except ValueError:
+        days_until = 999
+
+    complexity = infer_complexity(name)
+    parts = []
+    if days_until <= 2:
+        parts.append("due very soon")
+    elif days_until <= 7:
+        parts.append(f"due in {days_until} days")
+    else:
+        parts.append(f"due {due_str}")
+    parts.append(complexity_label(complexity))
+    if pushes > 0:
+        parts.append(f"pushed {pushes}×")
+    return ", ".join(parts)
+
+
 # --- INTENT PARSER ---
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -224,7 +338,7 @@ Convert the user's message into a structured JSON command. Output ONLY the JSON 
 
 Schema:
 {{
-  "action": "schedule" | "push" | "complete" | "delete" | "list" | "clarify",
+  "action": "schedule" | "push" | "complete" | "delete" | "list" | "next" | "query" | "clarify",
   "task_title": string | null,
   "urgency": "normal" | "asap",
   "target_date": "YYYY-MM-DD" | null,
@@ -239,6 +353,8 @@ Rules:
 - action "push": user wants to delay a task (delta_days = number of days, or 7 for "one week / next week")
 - action "complete": user says they finished something
 - action "delete": user wants to remove a task without marking it complete
+- action "query": user asks about an existing task's deadline (e.g. "when is X due", "what's the deadline for X")
+- action "next": user asks what to work on next / what's most important / what should I do
 - action "list": user wants to see the queue
 - action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
 - urgency "asap": only if user says urgent / ASAP / emergency / as soon as possible
@@ -454,8 +570,9 @@ async def weekly_queue_summary():
     if not deadlines:
         await dm_user("📋 **Weekly Queue** — No deadlines in the queue. You're clear.")
         return
-    lines = ["📋 **Weekly Queue:**\n"]
-    for e in deadlines:
+    ranked = rank_deadlines(deadlines)
+    lines = ["📋 **Weekly Queue** _(by priority)_:\n"]
+    for i, e in enumerate(ranked):
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         date_str = e["start"]["dateTime"][:10]
         meta = parse_meta(e)
@@ -468,7 +585,8 @@ async def weekly_queue_summary():
             if orig_match:
                 suffix += f", originally {orig_match.group(1)}"
             suffix += ")_"
-        lines.append(f"• {name} — due {date_str}{suffix}")
+        prefix = "🔴" if i == 0 else "•"
+        lines.append(f"{prefix} {name} — due {date_str}{suffix}")
     await dm_user("\n".join(lines))
 
 
@@ -589,6 +707,108 @@ async def on_message(message):
                 pending_clarifications[user_id] = content
                 question = command.get("clarification_question", "Could you clarify?")
                 await message.reply(f"❓ {question}", mention_author=False)
+                return
+
+            # Handle priority query directly — no calendar writes needed
+            if command.get("action") == "next":
+                deadlines = get_tether_deadlines()
+                if not deadlines:
+                    await message.reply(
+                        "Queue is empty. Nothing to work on.", mention_author=False
+                    )
+                    return
+                top = rank_deadlines(deadlines)[0]
+                name = (
+                    top["summary"]
+                    .replace(DEADLINE_PREFIX, "")
+                    .replace("— DUE", "")
+                    .strip()
+                )
+                reason = priority_reason(top)
+                await message.reply(f"🔴 **{name}** — {reason}.", mention_author=False)
+                return
+
+            # Handle completion directly — no scheduler session needed
+            if command.get("action") == "complete":
+                task_title = command.get("task_title") or ""
+                deadlines = get_tether_deadlines()
+                matches = [
+                    e
+                    for e in deadlines
+                    if task_title.lower() in e.get("summary", "").lower()
+                ]
+                if not matches:
+                    await message.reply(
+                        f"No scheduled task matching **{task_title}**.",
+                        mention_author=False,
+                    )
+                    return
+                if len(matches) > 1:
+                    names = ", ".join(
+                        e["summary"]
+                        .replace(DEADLINE_PREFIX, "")
+                        .replace("— DUE", "")
+                        .strip()
+                        for e in matches
+                    )
+                    await message.reply(
+                        f"Multiple matches: {names}. Be more specific.",
+                        mention_author=False,
+                    )
+                    return
+                e = matches[0]
+                name = (
+                    e["summary"]
+                    .replace(DEADLINE_PREFIX, "")
+                    .replace("— DUE", "")
+                    .strip()
+                )
+                service.events().delete(calendarId="primary", eventId=e["id"]).execute()
+                remaining = get_tether_deadlines()
+                if remaining:
+                    ranked = rank_deadlines(remaining)
+                    next_name = (
+                        ranked[0]["summary"]
+                        .replace(DEADLINE_PREFIX, "")
+                        .replace("— DUE", "")
+                        .strip()
+                    )
+                    next_due = ranked[0]["start"]["dateTime"][:10]
+                    await message.reply(
+                        f"✅ **{name}** done. Up next: **{next_name}** — due {next_due}.",
+                        mention_author=False,
+                    )
+                else:
+                    await message.reply(
+                        f"✅ **{name}** done. Queue is clear.", mention_author=False
+                    )
+                log(f"[COMPLETE] {name}")
+                return
+            if command.get("action") == "query":
+                task_title = command.get("task_title") or ""
+                deadlines = get_tether_deadlines()
+                matches = [
+                    e
+                    for e in deadlines
+                    if task_title.lower() in e.get("summary", "").lower()
+                ]
+                if not matches:
+                    await message.reply(
+                        f"No scheduled task matching **{task_title}**.",
+                        mention_author=False,
+                    )
+                else:
+                    e = matches[0]
+                    name = (
+                        e["summary"]
+                        .replace(DEADLINE_PREFIX, "")
+                        .replace("— DUE", "")
+                        .strip()
+                    )
+                    due = e["start"]["dateTime"][:10]
+                    await message.reply(
+                        f"**{name}** is due {due}.", mention_author=False
+                    )
                 return
 
             # Pass structured intent to scheduler session
