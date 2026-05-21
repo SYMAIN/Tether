@@ -6,6 +6,15 @@ services:
         stdin_open: true
         tty: true
         restart: always
+        dns:
+            - 8.8.8.8
+            - 1.1.1.1
+        healthcheck:
+            test: ["CMD", "python", "-c", "import socket; socket.setdefaulttimeout(5); socket.socket().connect(('discord.com', 443))"]
+            interval: 30m
+            timeout: 10s
+            retries: 3
+            start_period: 30s
         volumes:
             - ./token.json:/app/token.json
             - ./credentials.json:/app/credentials.json
