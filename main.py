@@ -170,10 +170,9 @@ def get_events_in_window(hours_from_now: int):
 
 
 def get_overdue_tether_events():
-    """Returns Tether deadlines that ended today before now."""
+    """Returns all past-due Tether deadlines (not just today's)."""
     now_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    now_local = datetime.datetime.now(TORONTO_TZ)
-    result = (
+    events_result = (
         service.events()
         .list(
             calendarId="primary",
@@ -185,17 +184,13 @@ def get_overdue_tether_events():
         .execute()
     )
     overdue = []
-    for e in result.get("items", []):
+    for e in events_result.get("items", []):
         if not e.get("summary", "").startswith(DEADLINE_PREFIX):
             continue
         end_str = e.get("end", {}).get("dateTime")
         if not end_str:
             continue
-        end = datetime.datetime.fromisoformat(end_str)
-        if end.tzinfo is None:
-            end = TORONTO_TZ.localize(end)
-        if end.date() == now_local.date():
-            overdue.append(e)
+        overdue.append(e)
     return overdue
 
 
@@ -597,12 +592,20 @@ async def inactivity_check():
     today = datetime.datetime.now(TORONTO_TZ).date()
     stale_threshold = 5
     all_stale = all(
-        (
-            today
-            - datetime.date.fromisoformat(
-                parse_meta(e).get("last_modified", str(today))
-            )
-        ).days
+        min(
+            (
+                today
+                - datetime.date.fromisoformat(
+                    parse_meta(e).get("last_modified", str(today))
+                )
+            ).days,
+            (
+                today
+                - datetime.date.fromisoformat(
+                    parse_meta(e).get("created_at", str(today))
+                )
+            ).days,
+        )
         >= stale_threshold
         for e in deadlines
     )
