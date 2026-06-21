@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import datetime
 import discord
@@ -33,9 +34,7 @@ MORNING_BRIEFING_ENABLED = (
 TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 
 # --- NAG STATE (in-memory, per session) ---
-# Set of event IDs that still need acknowledgement this session
 unacknowledged_overdue: set[str] = set()
-# How many times we've nagged this session without a response
 nag_count: int = 0
 
 
@@ -111,6 +110,7 @@ def create_calendar_event(
     summary: str, start_time: str, end_time: str, origin: str = "normal"
 ):
     """Creates a calendar event. Times must be ISO format (YYYY-MM-DDTHH:MM:SS)."""
+    # Hard override: Gemini sometimes passes midnight — force to 23:59
     if "T00:00:00" in start_time:
         date_part = start_time[:10]
         start_time = f"{date_part}T23:59:00"
@@ -329,19 +329,18 @@ def priority_reason(event: dict) -> str:
     today = datetime.datetime.now(TORONTO_TZ).date()
     meta = parse_meta(event)
     pushes = meta["pushes"]
-    name = (
-        event.get("summary", "")
-        .replace(DEADLINE_PREFIX, "")
-        .replace("— DUE", "")
-        .strip()
-    )
     due_str = event.get("start", {}).get("dateTime", "")[:10]
     try:
         due_date = datetime.date.fromisoformat(due_str)
         days_until = (due_date - today).days
     except ValueError:
         days_until = 999
-    complexity = infer_complexity(name)
+    complexity = infer_complexity(
+        event.get("summary", "")
+        .replace(DEADLINE_PREFIX, "")
+        .replace("— DUE", "")
+        .strip()
+    )
     parts = []
     if days_until <= 2:
         parts.append("due very soon")
@@ -357,7 +356,6 @@ def priority_reason(event: dict) -> str:
 
 # --- NAG WORDING ENGINE ---
 def nag_message(event: dict, session_nag_count: int) -> str:
-    """Returns escalating nag text based on push history and how many times we've nagged this session."""
     meta = parse_meta(event)
     pushes = meta["pushes"]
     nag_ignored = meta.get("nag_ignored", 0)
@@ -374,8 +372,6 @@ def nag_message(event: dict, session_nag_count: int) -> str:
     )
     last_reason = meta.get("last_push_reason", "")
     reason_str = f' Last reason: "{last_reason}".' if last_reason else ""
-
-    # Total pressure = pushes + ignored nags from prior sessions
     total_pressure = pushes + nag_ignored + session_nag_count
 
     if total_pressure == 0:
@@ -435,7 +431,7 @@ Rules:
 - action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
 - push_reason: extract any reason or explanation the user gives for pushing — from "because <reason>", "since <reason>", or any explanation in the message. null if no reason given
 - urgency "asap": only if user says urgent / ASAP / emergency
-- target_date: nearest future date matching what the user said; null if not given
+- target_date: nearest future date matching what the user said (e.g. "by Friday" → next Friday as YYYY-MM-DD, "before July" → last day of June as YYYY-MM-DD, "before [month]" → last day of the prior month); null if not given
 - delta_days: for push only; null otherwise
 - needs_clarification: true if confidence < {CONFIDENCE_THRESHOLD} OR action is ambiguous
 - clarification_question: single concise question to resolve ambiguity
@@ -585,50 +581,33 @@ async def dm_user(message: str):
 
 # --- NAG LOOP ---
 async def send_overdue_nag():
-    """Sends nag DMs for all unacknowledged overdue tasks. Called on startup and every 30 min."""
     global nag_count, unacknowledged_overdue
-
-    # Refresh overdue list — a task may have been pushed/completed via @Tether
     current_overdue = get_overdue_tether_events()
     current_ids = {e["id"] for e in current_overdue}
-
-    # Remove from unacknowledged if it no longer exists in calendar
     unacknowledged_overdue = unacknowledged_overdue & current_ids
-
-    # Add any newly discovered overdue tasks
     for e in current_overdue:
         unacknowledged_overdue.add(e["id"])
-
     if not unacknowledged_overdue:
         return
-
-    # Build event lookup
     event_map = {e["id"]: e for e in current_overdue}
     pending = [event_map[eid] for eid in unacknowledged_overdue if eid in event_map]
-
     if not pending:
         return
-
     lines = [nag_summary_header(nag_count)]
     for e in pending:
         lines.append(nag_message(e, nag_count))
-
     await dm_user("\n".join(lines))
     nag_count += 1
     log(f"[NAG #{nag_count}] {len(pending)} unacknowledged tasks")
 
 
 async def midnight_nag_persist():
-    """At midnight: if tasks are still unacknowledged, increment nag_ignored in their meta."""
     global nag_count, unacknowledged_overdue
-
     if not unacknowledged_overdue:
         nag_count = 0
         return
-
     current_overdue = get_overdue_tether_events()
     event_map = {e["id"]: e for e in current_overdue}
-
     for eid in list(unacknowledged_overdue):
         if eid not in event_map:
             continue
@@ -639,15 +618,12 @@ async def midnight_nag_persist():
         original_due = (
             orig_match.group(1) if orig_match else event["start"]["dateTime"][:10]
         )
-
         meta["nag_ignored"] = meta.get("nag_ignored", 0) + nag_count
         meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
-
         new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
         event["description"] = new_desc
         service.events().update(calendarId="primary", eventId=eid, body=event).execute()
         log(f"[MIDNIGHT] incremented nag_ignored on {event.get('summary')}")
-
     nag_count = 0
     await dm_user(
         f"🌙 Midnight check-in: {len(unacknowledged_overdue)} task(s) still unacknowledged. "
@@ -703,11 +679,10 @@ async def morning_briefing():
 
 
 async def eod_sweep():
-    """EOD sweep is now just a backup — nag loop handles primary pressure."""
+    """EOD sweep — nag loop handles primary pressure; this just logs."""
     overdue = get_overdue_tether_events()
     if not overdue:
         await dm_user("✅ EOD — no overdue tasks. Queue is clean.")
-    # Nag loop already handles individual task messages, so EOD just logs silently
     log(f"[EOD] {len(overdue)} overdue at EOD")
 
 
@@ -749,7 +724,6 @@ async def inactivity_check():
     if not deadlines:
         return
     today = datetime.datetime.now(TORONTO_TZ).date()
-    stale_threshold = 5
     all_stale = all(
         min(
             (
@@ -765,7 +739,7 @@ async def inactivity_check():
                 )
             ).days,
         )
-        >= stale_threshold
+        >= 5
         for e in deadlines
     )
     if all_stale:
@@ -788,7 +762,7 @@ async def already_dmed_today(keyword: str) -> bool:
 
 
 async def run_morning_jobs():
-    """Runs all morning jobs as a single unit with one dedup check."""
+    """Consolidated morning jobs with single dedup check."""
     if await already_dmed_today("Morning briefing"):
         return
     await morning_briefing()
@@ -797,10 +771,6 @@ async def run_morning_jobs():
 
 # --- PUSH VALIDATION ---
 def validate_push_command(command: dict) -> tuple[bool, str]:
-    """
-    Returns (is_valid, error_message).
-    A push is valid only if it has a push_reason. Date is chosen by Gemini.
-    """
     if not command.get("push_reason"):
         return (
             False,
@@ -812,12 +782,6 @@ def validate_push_command(command: dict) -> tuple[bool, str]:
 def pick_push_date(
     task_name: str, push_reason: str, current_queue: list, original_message: str = ""
 ) -> str:
-    """
-    Asks Gemini to pick a reasonable new deadline based on the reason,
-    the full original message (preserves timeframe hints like "a week or 2"),
-    task complexity, and what's already in the queue.
-    Returns a YYYY-MM-DD string.
-    """
     today = datetime.datetime.now(TORONTO_TZ).strftime("%A, %B %d, %Y")
     queue_summary = (
         "\n".join(
@@ -827,11 +791,9 @@ def pick_push_date(
         )
         or "Queue is empty."
     )
-
     message_context = (
         f"Full user message: {original_message}\n" if original_message else ""
     )
-
     prompt = (
         f"Today is {today}.\n"
         f"Task: {task_name}\n"
@@ -844,42 +806,32 @@ def pick_push_date(
         f"Do not pile deadlines on top of each other unless unavoidable. "
         f"Respond with ONLY a date in YYYY-MM-DD format. No explanation."
     )
-
     for model in MODELS:
         try:
             response = gemini_client.models.generate_content(
-                model=model,
-                contents=prompt,
+                model=model, contents=prompt
             )
             raw = response.text.strip()
-            # Validate it looks like a date
             datetime.date.fromisoformat(raw)
             return raw
         except Exception:
             continue
-
-    # Hard fallback: 7 days from today
     fallback = datetime.datetime.now(TORONTO_TZ) + datetime.timedelta(days=7)
     return fallback.strftime("%Y-%m-%d")
 
 
 async def handle_push_with_reason(command: dict, content: str, message):
-    """Validates reason, asks Gemini to pick the date, updates calendar + meta."""
     task_title = command.get("task_title") or ""
     push_reason = command.get("push_reason", "")
-
-    # Find matching overdue or upcoming task
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
     matches = [
         e for e in all_tasks if task_title.lower() in e.get("summary", "").lower()
     ]
-
     if not matches:
         await message.reply(
             f"No task matching **{task_title}** found.", mention_author=False
         )
         return
-
     if len(matches) > 1:
         names = ", ".join(
             e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
@@ -889,7 +841,6 @@ async def handle_push_with_reason(command: dict, content: str, message):
             f"Multiple matches: {names}. Be more specific.", mention_author=False
         )
         return
-
     e = matches[0]
     event_id = e["id"]
     meta = parse_meta(e)
@@ -898,18 +849,15 @@ async def handle_push_with_reason(command: dict, content: str, message):
     original_due = orig_match.group(1) if orig_match else e["start"]["dateTime"][:10]
     name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
 
-    # Gemini picks the date — pass full original message to preserve timeframe hints
     current_queue = get_tether_deadlines()
     target_date = pick_push_date(
         name, push_reason, current_queue, original_message=content
     )
 
-    # Update event date
     new_start = f"{target_date}T23:59:00"
     e["start"] = {"dateTime": new_start, "timeZone": "America/Toronto"}
     e["end"] = {"dateTime": new_start, "timeZone": "America/Toronto"}
 
-    # Update meta
     meta["pushes"] = meta["pushes"] + 1
     meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta["last_push_reason"] = push_reason
@@ -917,8 +865,6 @@ async def handle_push_with_reason(command: dict, content: str, message):
     e["description"] = new_desc
 
     service.events().update(calendarId="primary", eventId=event_id, body=e).execute()
-
-    # Remove from nag list since user responded
     unacknowledged_overdue.discard(event_id)
 
     await message.reply(
@@ -932,23 +878,19 @@ async def handle_push_with_reason(command: dict, content: str, message):
 
 
 async def handle_keep(command: dict, message):
-    """User acknowledges an overdue task and commits to keeping it."""
     task_title = command.get("task_title") or ""
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
     matches = [
         e for e in all_tasks if task_title.lower() in e.get("summary", "").lower()
     ]
-
     if not matches:
         await message.reply(
             f"No task matching **{task_title}** found.", mention_author=False
         )
         return
-
     e = matches[0]
     event_id = e["id"]
     name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
-
     unacknowledged_overdue.discard(event_id)
     await message.reply(
         f"✅ Got it — **{name}** stays. I'll keep watching it.",
@@ -963,7 +905,10 @@ async def on_ready():
     nag_count = 0
     unacknowledged_overdue = set()
 
+    await asyncio.sleep(3)  # Give Discord state time to settle
+
     print(f"Tether is online as {bot.user}")
+    # ... rest of on_ready
     scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
 
     if TEST_MODE:
@@ -975,14 +920,12 @@ async def on_ready():
         for job in jobs:
             scheduler.add_job(job, "date", run_date=fire_at, misfire_grace_time=60)
     else:
-        # Nag loop: every 30 minutes
         scheduler.add_job(
             send_overdue_nag,
             CronTrigger(minute="*/30", timezone=TORONTO_TZ),
             misfire_grace_time=None,
             coalesce=True,
         )
-        # Midnight: persist ignored nags to meta
         scheduler.add_job(
             midnight_nag_persist,
             CronTrigger(hour=0, minute=0, timezone=TORONTO_TZ),
@@ -1015,10 +958,8 @@ async def on_ready():
             coalesce=True,
         )
 
-        # Startup: fire nag immediately if overdue tasks exist
         await send_overdue_nag()
 
-        # Catch-up for other jobs
         now = datetime.datetime.now(TORONTO_TZ)
         if MORNING_BRIEFING_ENABLED and now.hour >= 9:
             await run_morning_jobs()
@@ -1055,9 +996,23 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
+            # If user is responding to a clarification, route directly to scheduler session
             if user_id in pending_clarifications:
-                original = pending_clarifications.pop(user_id)
-                content = f"{original} — clarification: {content}"
+                pending_clarifications.pop(user_id)
+                chat = get_or_create_session(user_id)
+                today = datetime.datetime.now(TORONTO_TZ)
+                next_sunday = get_next_sunday(today)
+                follow_up_prompt = (
+                    f"[DATE] Today is {today.strftime('%A, %B %d, %Y')}. "
+                    f"Next Sunday is {next_sunday.strftime('%B %d, %Y')} — use {next_sunday.strftime('%Y-%m-%d')}T23:59:00 as the default deadline.\n\n"
+                    f"User follow-up: {content}"
+                )
+                response, _ = send_with_fallback(chat, user_id, follow_up_prompt)
+                reply = extract_reply(response, chat)
+                log(f"[CLARIFICATION REPLY to {message.author}] {reply[:200]}")
+                for i in range(0, len(reply), 2000):
+                    await message.reply(reply[i : i + 2000], mention_author=False)
+                return
 
             command, _ = parse_intent_with_fallback(content)
             log(f"[INTENT] {message.author}: {json.dumps(command)}")
@@ -1073,7 +1028,7 @@ async def on_message(message):
                 await handle_keep(command, message)
                 return
 
-            # --- PUSH (with validation) ---
+            # --- PUSH ---
             if command.get("action") == "push":
                 is_valid, error_msg = validate_push_command(command)
                 if not is_valid:
@@ -1191,11 +1146,19 @@ async def on_message(message):
 
             # --- PASS TO SCHEDULER SESSION ---
             chat = get_or_create_session(user_id)
+            today = datetime.datetime.now(TORONTO_TZ)
+            next_sunday = get_next_sunday(today)
             scheduler_prompt = (
+                f"[DATE] Today is {today.strftime('%A, %B %d, %Y')}. "
+                f"Next Sunday is {next_sunday.strftime('%B %d, %Y')} — use {next_sunday.strftime('%Y-%m-%d')}T23:59:00 as the default deadline.\n\n"
                 f"[PARSED INTENT] {json.dumps(command)}\n\nOriginal message: {content}"
             )
             response, _ = send_with_fallback(chat, user_id, scheduler_prompt)
             reply = extract_reply(response, chat)
+
+            # If scheduler responded with a question, flag user as pending clarification
+            if reply.strip().endswith("?"):
+                pending_clarifications[user_id] = content
 
             log(f"[REPLY to {message.author}] {reply[:200]}")
             for i in range(0, len(reply), 2000):
