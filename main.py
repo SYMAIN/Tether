@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import json
 import datetime
@@ -28,6 +29,7 @@ MODELS = [
 ]
 
 CONFIDENCE_THRESHOLD = 0.7
+LOG_RETENTION_DAYS = 30
 MORNING_BRIEFING_ENABLED = (
     os.environ.get("MORNING_BRIEFING_ENABLED", "true").lower() == "true"
 )
@@ -36,6 +38,8 @@ TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 # --- NAG STATE (in-memory, per session) ---
 unacknowledged_overdue: set[str] = set()
 nag_count: int = 0
+task_nag_counts: dict[str, int] = {}
+_started: bool = False
 
 
 # --- META ---
@@ -87,6 +91,19 @@ def log(entry: str):
         f.write(f"[{timestamp}] {entry}\n")
 
 
+def trim_log():
+    if not os.path.exists(LOG_FILE):
+        return
+    cutoff = (
+        datetime.datetime.now(TORONTO_TZ) - datetime.timedelta(days=LOG_RETENTION_DAYS)
+    ).strftime("%Y-%m-%d")
+    with open(LOG_FILE, "r") as f:
+        lines = f.readlines()
+    kept = [l for l in lines if not l.startswith("[") or l[1:11] >= cutoff]
+    with open(LOG_FILE, "w") as f:
+        f.writelines(kept)
+
+
 # --- CALENDAR SETUP ---
 def get_calendar_service():
     creds = None
@@ -102,7 +119,14 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-service = get_calendar_service()
+_service = None
+
+
+def get_service():
+    global _service
+    if _service is None:
+        _service = get_calendar_service()
+    return _service
 
 
 # --- CALENDAR TOOLS ---
@@ -125,12 +149,12 @@ def create_calendar_event(
         "end": {"dateTime": end_time, "timeZone": "America/Toronto"},
         "colorId": "5",
     }
-    return service.events().insert(calendarId="primary", body=event).execute()
+    return get_service().events().insert(calendarId="primary", body=event).execute()
 
 
 def update_event_meta(event_id: str, pushes: int):
     """Increments push count and updates last_modified on a Tether event."""
-    event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    event = get_service().events().get(calendarId="primary", eventId=event_id).execute()
     meta = parse_meta(event)
     desc = event.get("description", "") or ""
     orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
@@ -144,7 +168,7 @@ def update_event_meta(event_id: str, pushes: int):
     description += f"\nOriginally due: {original_due or new_due}"
 
     event["description"] = description
-    service.events().update(
+    get_service().events().update(
         calendarId="primary", eventId=event_id, body=event
     ).execute()
     return {"status": "updated", "pushes": pushes}
@@ -152,7 +176,7 @@ def update_event_meta(event_id: str, pushes: int):
 
 def delete_calendar_event(event_id: str):
     """Deletes a calendar event by its event ID."""
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    get_service().events().delete(calendarId="primary", eventId=event_id).execute()
     return {"status": "deleted", "event_id": event_id}
 
 
@@ -160,7 +184,7 @@ def list_upcoming_events(max_results: int = 20):
     """Returns upcoming events to check the queue and find free slots."""
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     result = (
-        service.events()
+        get_service().events()
         .list(
             calendarId="primary",
             timeMin=now,
@@ -219,7 +243,7 @@ def get_overdue_tether_events():
         )
         if page_token:
             params["pageToken"] = page_token
-        result = service.events().list(**params).execute()
+        result = get_service().events().list(**params).execute()
         all_items.extend(result.get("items", []))
         page_token = result.get("nextPageToken")
         if not page_token:
@@ -235,7 +259,7 @@ def get_overdue_tether_events():
 
 def complete_task(event_id: str):
     """Marks a Tether deadline as done and signals the queue to advance."""
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    get_service().events().delete(calendarId="primary", eventId=event_id).execute()
     remaining = get_tether_deadlines()
     return {
         "status": "completed",
@@ -288,11 +312,25 @@ COMPLEXITY_LOW = [
 
 def infer_complexity(task_title: str) -> int:
     title = task_title.lower()
-    if any(w in title for w in COMPLEXITY_HIGH):
+    if any(re.search(r"\b" + w + r"\b", title) for w in COMPLEXITY_HIGH):
         return 3
-    if any(w in title for w in COMPLEXITY_MED):
+    if any(re.search(r"\b" + w + r"\b", title) for w in COMPLEXITY_MED):
         return 2
     return 1
+
+
+def task_matches(query: str, event: dict) -> bool:
+    name = (
+        event.get("summary", "")
+        .replace(DEADLINE_PREFIX, "")
+        .replace("— DUE", "")
+        .strip()
+        .lower()
+    )
+    q = query.lower().strip()
+    return q == name or all(
+        re.search(r"\b" + re.escape(word) + r"\b", name) for word in q.split()
+    )
 
 
 def priority_score(event: dict) -> float:
@@ -515,7 +553,9 @@ def get_scheduler_chat(model=None):
 
 user_sessions: dict = {}
 user_model_index: dict = {}
+user_fallback_time: dict[int, float] = {}
 pending_clarifications: dict[int, str] = {}
+FALLBACK_COOLDOWN = 300
 
 
 def get_or_create_session(user_id: int):
@@ -527,16 +567,21 @@ def get_or_create_session(user_id: int):
 
 def send_with_fallback(chat, user_id: int, message_content: str):
     current_index = user_model_index.get(user_id, 0)
+    if current_index > 0:
+        elapsed = time.time() - user_fallback_time.get(user_id, 0)
+        if elapsed > FALLBACK_COOLDOWN:
+            current_index = 0
+            user_model_index[user_id] = 0
+            user_fallback_time.pop(user_id, None)
     for i in range(current_index, len(MODELS)):
         try:
             if i != current_index:
                 chat = get_scheduler_chat(MODELS[i])
                 user_sessions[user_id] = chat
                 user_model_index[user_id] = i
+                if user_id not in user_fallback_time:
+                    user_fallback_time[user_id] = time.time()
             response = chat.send_message(message_content)
-            if i != 0:
-                user_model_index[user_id] = 0
-                user_sessions[user_id] = get_scheduler_chat(MODELS[0])
             return response, MODELS[i]
         except Exception as e:
             if any(
@@ -561,10 +606,7 @@ def extract_reply(response, chat) -> str:
         for part in response.candidates[0].content.parts
         if hasattr(part, "text") and part.text
     ]
-    if text_parts:
-        return "".join(text_parts)
-    follow_up = chat.send_message("Confirm what you just did in one line.")
-    return follow_up.text or "Done."
+    return "".join(text_parts) if text_parts else "Done."
 
 
 # --- DISCORD BOT ---
@@ -581,7 +623,7 @@ async def dm_user(message: str):
 
 # --- NAG LOOP ---
 async def send_overdue_nag():
-    global nag_count, unacknowledged_overdue
+    global nag_count, unacknowledged_overdue, task_nag_counts
     current_overdue = get_overdue_tether_events()
     current_ids = {e["id"] for e in current_overdue}
     unacknowledged_overdue = unacknowledged_overdue & current_ids
@@ -595,14 +637,17 @@ async def send_overdue_nag():
         return
     lines = [nag_summary_header(nag_count)]
     for e in pending:
-        lines.append(nag_message(e, nag_count))
+        eid = e["id"]
+        lines.append(nag_message(e, task_nag_counts.get(eid, 0)))
+        task_nag_counts[eid] = task_nag_counts.get(eid, 0) + 1
     await dm_user("\n".join(lines))
     nag_count += 1
     log(f"[NAG #{nag_count}] {len(pending)} unacknowledged tasks")
 
 
 async def midnight_nag_persist():
-    global nag_count, unacknowledged_overdue
+    global nag_count, unacknowledged_overdue, task_nag_counts
+    trim_log()
     if not unacknowledged_overdue:
         nag_count = 0
         return
@@ -611,20 +656,21 @@ async def midnight_nag_persist():
     for eid in list(unacknowledged_overdue):
         if eid not in event_map:
             continue
-        event = service.events().get(calendarId="primary", eventId=eid).execute()
+        event = get_service().events().get(calendarId="primary", eventId=eid).execute()
         meta = parse_meta(event)
         desc = event.get("description", "") or ""
         orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
         original_due = (
             orig_match.group(1) if orig_match else event["start"]["dateTime"][:10]
         )
-        meta["nag_ignored"] = meta.get("nag_ignored", 0) + nag_count
+        meta["nag_ignored"] = meta.get("nag_ignored", 0) + 1
         meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
         new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
         event["description"] = new_desc
-        service.events().update(calendarId="primary", eventId=eid, body=event).execute()
+        get_service().events().update(calendarId="primary", eventId=eid, body=event).execute()
         log(f"[MIDNIGHT] incremented nag_ignored on {event.get('summary')}")
     nag_count = 0
+    task_nag_counts.clear()
     await dm_user(
         f"🌙 Midnight check-in: {len(unacknowledged_overdue)} task(s) still unacknowledged. "
         f"They'll be waiting when you're back."
@@ -688,10 +734,15 @@ async def eod_sweep():
 
 async def deadline_warning():
     upcoming = get_events_in_window(hours_from_now=24)
+    today = datetime.datetime.now(TORONTO_TZ).date()
     for e in upcoming:
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        start = datetime.datetime.fromisoformat(e["start"]["dateTime"])
+        if start.tzinfo is None:
+            start = TORONTO_TZ.localize(start)
         due = e["start"]["dateTime"][11:16]
-        await dm_user(f"⏰ **Heads up:** {name} is due tomorrow at {due}.")
+        when = "today" if start.date() == today else "tomorrow"
+        await dm_user(f"⏰ **Heads up:** {name} is due {when} at {due}.")
 
 
 async def weekly_queue_summary():
@@ -748,25 +799,28 @@ async def inactivity_check():
         )
 
 
-async def already_dmed_today(keyword: str) -> bool:
-    user = await bot.fetch_user(DISCORD_USER_ID)
-    dm = await user.create_dm()
-    today = datetime.datetime.now(TORONTO_TZ).date()
-    async for msg in dm.history(limit=50):
-        msg_date = msg.created_at.astimezone(TORONTO_TZ).date()
-        if msg_date < today:
-            break
-        if msg.author == bot.user and keyword in msg.content:
-            return True
+def already_ran_today(keyword: str) -> bool:
+    today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
+    if not os.path.exists(LOG_FILE):
+        return False
+    with open(LOG_FILE, "r") as f:
+        for line in f:
+            if today in line and keyword in line:
+                return True
     return False
 
 
 async def run_morning_jobs():
-    """Consolidated morning jobs with single dedup check."""
-    if await already_dmed_today("Morning briefing"):
+    if already_ran_today("Morning briefing"):
         return
     await morning_briefing()
     await deadline_warning()
+
+
+async def run_sunday_morning():
+    await run_morning_jobs()
+    if not already_ran_today("Weekly Queue"):
+        await weekly_queue_summary()
 
 
 # --- PUSH VALIDATION ---
@@ -781,7 +835,7 @@ def validate_push_command(command: dict) -> tuple[bool, str]:
 
 def pick_push_date(
     task_name: str, push_reason: str, current_queue: list, original_message: str = ""
-) -> str:
+) -> tuple[str, bool]:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%A, %B %d, %Y")
     queue_summary = (
         "\n".join(
@@ -813,11 +867,11 @@ def pick_push_date(
             )
             raw = response.text.strip()
             datetime.date.fromisoformat(raw)
-            return raw
+            return raw, False
         except Exception:
             continue
     fallback = datetime.datetime.now(TORONTO_TZ) + datetime.timedelta(days=7)
-    return fallback.strftime("%Y-%m-%d")
+    return fallback.strftime("%Y-%m-%d"), True
 
 
 async def handle_push_with_reason(command: dict, content: str, message):
@@ -825,7 +879,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
     push_reason = command.get("push_reason", "")
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
     matches = [
-        e for e in all_tasks if task_title.lower() in e.get("summary", "").lower()
+        e for e in all_tasks if task_matches(task_title, e)
     ]
     if not matches:
         await message.reply(
@@ -850,7 +904,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
     name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
 
     current_queue = get_tether_deadlines()
-    target_date = pick_push_date(
+    target_date, date_fallback = pick_push_date(
         name, push_reason, current_queue, original_message=content
     )
 
@@ -864,12 +918,14 @@ async def handle_push_with_reason(command: dict, content: str, message):
     new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
     e["description"] = new_desc
 
-    service.events().update(calendarId="primary", eventId=event_id, body=e).execute()
+    get_service().events().update(calendarId="primary", eventId=event_id, body=e).execute()
     unacknowledged_overdue.discard(event_id)
+    task_nag_counts.pop(event_id, None)
 
+    fallback_note = " _(AI unavailable — defaulted to 7 days)_" if date_fallback else ""
     await message.reply(
         f"📅 **{name}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
-        f"Push #{meta['pushes']}.",
+        f"Push #{meta['pushes']}.{fallback_note}",
         mention_author=False,
     )
     log(
@@ -881,7 +937,7 @@ async def handle_keep(command: dict, message):
     task_title = command.get("task_title") or ""
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
     matches = [
-        e for e in all_tasks if task_title.lower() in e.get("summary", "").lower()
+        e for e in all_tasks if task_matches(task_title, e)
     ]
     if not matches:
         await message.reply(
@@ -892,6 +948,7 @@ async def handle_keep(command: dict, message):
     event_id = e["id"]
     name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
     unacknowledged_overdue.discard(event_id)
+    task_nag_counts.pop(event_id, None)
     await message.reply(
         f"✅ Got it — **{name}** stays. I'll keep watching it.",
         mention_author=False,
@@ -901,9 +958,17 @@ async def handle_keep(command: dict, message):
 
 @bot.event
 async def on_ready():
-    global nag_count, unacknowledged_overdue
+    global nag_count, unacknowledged_overdue, task_nag_counts, _started
+    if _started:
+        # on_ready fires on every gateway reconnect, not just the first connect.
+        # Without this guard, each reconnect stacks a new AsyncIOScheduler on top
+        # of the still-running one, so jobs fire multiple times per cron tick.
+        return
+    _started = True
+
     nag_count = 0
     unacknowledged_overdue = set()
+    task_nag_counts.clear()
 
     await asyncio.sleep(3)  # Give Discord state time to settle
 
@@ -935,7 +1000,20 @@ async def on_ready():
         if MORNING_BRIEFING_ENABLED:
             scheduler.add_job(
                 run_morning_jobs,
-                CronTrigger(hour=9, minute=0, timezone=TORONTO_TZ),
+                CronTrigger(day_of_week="mon-sat", hour=9, minute=0, timezone=TORONTO_TZ),
+                misfire_grace_time=None,
+                coalesce=True,
+            )
+            scheduler.add_job(
+                run_sunday_morning,
+                CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
+                misfire_grace_time=None,
+                coalesce=True,
+            )
+        else:
+            scheduler.add_job(
+                weekly_queue_summary,
+                CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
                 misfire_grace_time=None,
                 coalesce=True,
             )
@@ -951,28 +1029,23 @@ async def on_ready():
             misfire_grace_time=None,
             coalesce=True,
         )
-        scheduler.add_job(
-            weekly_queue_summary,
-            CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TORONTO_TZ),
-            misfire_grace_time=None,
-            coalesce=True,
-        )
 
         await send_overdue_nag()
 
         now = datetime.datetime.now(TORONTO_TZ)
-        if MORNING_BRIEFING_ENABLED and now.hour >= 9:
-            await run_morning_jobs()
-        if now.hour >= 17 and not await already_dmed_today("No queue changes"):
+        if now.hour >= 9:
+            is_sunday = now.weekday() == 6
+            if MORNING_BRIEFING_ENABLED:
+                if is_sunday:
+                    await run_sunday_morning()
+                else:
+                    await run_morning_jobs()
+            elif is_sunday and not already_ran_today("Weekly Queue"):
+                await weekly_queue_summary()
+        if now.hour >= 17 and not already_ran_today("No queue changes"):
             await inactivity_check()
-        if now.hour >= 22 and not await already_dmed_today("EOD"):
+        if now.hour >= 22 and not already_ran_today("EOD"):
             await eod_sweep()
-        if (
-            now.weekday() == 6
-            and now.hour >= 9
-            and not await already_dmed_today("Weekly Queue")
-        ):
-            await weekly_queue_summary()
 
     scheduler.start()
 
@@ -1062,11 +1135,7 @@ async def on_message(message):
                 deadlines = get_tether_deadlines()
                 overdue = get_overdue_tether_events()
                 all_tasks = overdue + deadlines
-                matches = [
-                    e
-                    for e in all_tasks
-                    if task_title.lower() in e.get("summary", "").lower()
-                ]
+                matches = [e for e in all_tasks if task_matches(task_title, e)]
                 if not matches:
                     await message.reply(
                         f"No scheduled task matching **{task_title}**.",
@@ -1093,8 +1162,9 @@ async def on_message(message):
                     .replace("— DUE", "")
                     .strip()
                 )
-                service.events().delete(calendarId="primary", eventId=e["id"]).execute()
+                get_service().events().delete(calendarId="primary", eventId=e["id"]).execute()
                 unacknowledged_overdue.discard(e["id"])
+                task_nag_counts.pop(e["id"], None)
                 remaining = get_tether_deadlines()
                 if remaining:
                     ranked = rank_deadlines(remaining)
@@ -1120,11 +1190,7 @@ async def on_message(message):
             if command.get("action") == "query":
                 task_title = command.get("task_title") or ""
                 deadlines = get_tether_deadlines()
-                matches = [
-                    e
-                    for e in deadlines
-                    if task_title.lower() in e.get("summary", "").lower()
-                ]
+                matches = [e for e in deadlines if task_matches(task_title, e)]
                 if not matches:
                     await message.reply(
                         f"No scheduled task matching **{task_title}**.",
