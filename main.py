@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import belki_import
 import ledger
 from ledger import clean_name, infer_complexity, complexity_label
 
@@ -394,7 +395,7 @@ Convert the user's message into a structured JSON command. Output ONLY the JSON 
 
 Schema:
 {{
-  "action": "schedule" | "push" | "complete" | "delete" | "list" | "next" | "query" | "keep" | "clarify",
+  "action": "schedule" | "push" | "complete" | "delete" | "list" | "next" | "query" | "keep" | "sync" | "clarify",
   "task_title": string | null,
   "urgency": "normal" | "asap",
   "target_date": "YYYY-MM-DD" | null,
@@ -414,6 +415,7 @@ Rules:
 - action "next": user asks what to work on next
 - action "list": user wants to see the queue
 - action "keep": user says keep, it's staying, I'll do it — acknowledges an overdue task without pushing
+- action "sync": user asks to sync/import tasks from Belki (e.g. "sync belki"). task_title = the project name if the user names one, else null
 - action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
 - push_reason: extract any reason or explanation the user gives for pushing — from "because <reason>", "since <reason>", or any explanation in the message. null if no reason given
 - urgency "asap": only if user says urgent / ASAP / emergency
@@ -752,12 +754,24 @@ async def already_dmed_today(keyword: str) -> bool:
     return False
 
 
+def run_belki_sync(project_override: str = None) -> tuple[str, int]:
+    return belki_import.sync(
+        get_tether_deadlines(), _insert_deadline, project_override=project_override
+    )
+
+
 async def run_morning_jobs():
     """Consolidated morning jobs with single dedup check."""
     if await already_dmed_today("Morning briefing"):
         return
     await morning_briefing()
     await deadline_warning()
+    try:
+        text, imported = run_belki_sync()
+        if imported:
+            await dm_user(text)
+    except Exception as e:
+        log(f"[SYNC] morning Belki sync failed: {e}")
 
 
 # --- PUSH VALIDATION ---
@@ -811,6 +825,56 @@ def pick_push_date(
     return fallback.strftime("%Y-%m-%d")
 
 
+def next_free_sunday(from_date, deadlines, exclude_event_id=None) -> str:
+    """First Sunday on/after from_date whose slot holds no ⏰ deadline."""
+    taken = {
+        e["start"]["dateTime"][:10]
+        for e in deadlines
+        if e.get("id") != exclude_event_id and e.get("start", {}).get("dateTime")
+    }
+    d = from_date + datetime.timedelta(days=(6 - from_date.weekday()) % 7)
+    while d.isoformat() in taken:
+        d += datetime.timedelta(days=7)
+    return d.isoformat()
+
+
+def resolve_push_date(
+    command: dict, event: dict, meta: dict, name: str, push_reason: str,
+    current_queue: list, content: str,
+) -> str:
+    """Deterministic push-date precedence: explicit timeframe > estimate arithmetic > AI fallback."""
+    today = datetime.datetime.now(TORONTO_TZ).date()
+
+    target = command.get("target_date")
+    if target:
+        try:
+            if datetime.date.fromisoformat(target) > today:
+                return target
+        except ValueError:
+            pass
+    delta = command.get("delta_days")
+    if delta:
+        try:
+            delta = int(delta)
+            if delta > 0:
+                return (today + datetime.timedelta(days=delta)).isoformat()
+        except (TypeError, ValueError):
+            pass
+
+    # Belki estimates are integer evenings; 1 evening ≈ 1 calendar day of runway
+    estimate = meta.get("estimate")
+    if estimate:
+        try:
+            candidate = today + datetime.timedelta(days=int(estimate))
+            return next_free_sunday(
+                candidate, current_queue, exclude_event_id=event.get("id")
+            )
+        except (TypeError, ValueError):
+            pass
+
+    return pick_push_date(name, push_reason, current_queue, original_message=content)
+
+
 async def handle_push_with_reason(command: dict, content: str, message):
     task_title = command.get("task_title") or ""
     push_reason = command.get("push_reason", "")
@@ -842,8 +906,8 @@ async def handle_push_with_reason(command: dict, content: str, message):
     name = clean_name(e["summary"])
 
     current_queue = get_tether_deadlines()
-    target_date = pick_push_date(
-        name, push_reason, current_queue, original_message=content
+    target_date = resolve_push_date(
+        command, e, meta, name, push_reason, current_queue, content
     )
 
     new_start = f"{target_date}T23:59:00"
@@ -1029,6 +1093,14 @@ async def on_message(message):
             # --- KEEP ---
             if command.get("action") == "keep":
                 await handle_keep(command, message)
+                return
+
+            # --- SYNC (Belki import) ---
+            if command.get("action") == "sync":
+                text, imported = run_belki_sync(command.get("task_title"))
+                log(f"[SYNC] imported={imported} | {text[:200]}")
+                for i in range(0, len(text), 2000):
+                    await message.reply(text[i : i + 2000], mention_author=False)
                 return
 
             # --- PUSH ---
