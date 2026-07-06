@@ -123,11 +123,15 @@ def _next_sunday_on_or_after(d: datetime.date) -> datetime.date:
     return d + datetime.timedelta(days=(6 - d.weekday()) % 7)
 
 
-def sync(deadlines: list, insert_deadline, project_override: str = None) -> tuple[str, int]:
+def sync(
+    deadlines: list, insert_deadline, project_override: str = None, dry_run: bool = False
+) -> tuple[str, int]:
     """Imports the active project's new subtasks onto consecutive open Sundays.
 
     deadlines: current ⏰ queue events (main.get_tether_deadlines()).
     insert_deadline: main._insert_deadline.
+    dry_run: don't persist the active-project switch (caller passes a
+    non-inserting insert_deadline too).
     Returns (reply text, number imported).
     """
     if not os.path.isdir(BELKI_PATH):
@@ -234,5 +238,6 @@ def sync(deadlines: list, insert_deadline, project_override: str = None) -> tupl
         lines.append("Skipped lines I couldn't parse:")
         lines.extend(f"  ✗ {s}" for s in active["skipped"][:5])
 
-    ledger.set_state("active_project", active["name"])
+    if not dry_run:
+        ledger.set_state("active_project", active["name"])
     return ("\n".join(lines), imported)
