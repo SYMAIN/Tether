@@ -1,7 +1,8 @@
 """
 test_jobs.py — run scheduled jobs on demand without starting the bot.
-Usage: python test_jobs.py [morning|eod|inactivity|queue|nag|debug|all]
-Defaults to 'all' if no argument given.
+Usage: python test_jobs.py [morning|eod|inactivity|queue|nag|retro|sync|debug|all]
+Defaults to 'all' if no argument given. 'sync' is a dry run — it previews the
+Belki import without touching the calendar or the active-project state.
 """
 
 import asyncio
@@ -16,6 +17,10 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+import belki_import
+import ledger
+from ledger import clean_name, infer_complexity
+
 # --- CONFIG (mirrors main.py) ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 DEADLINE_PREFIX = "⏰"
@@ -23,32 +28,7 @@ TORONTO_TZ = pytz.timezone("America/Toronto")
 DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
 LOG_FILE = "tether.log"
 
-COMPLEXITY_HIGH = [
-    "exam",
-    "final",
-    "midterm",
-    "thesis",
-    "dissertation",
-    "project",
-    "build",
-    "app",
-    "bot",
-    "feature",
-    "system",
-    "redesign",
-    "research",
-]
-COMPLEXITY_MED = [
-    "report",
-    "essay",
-    "assignment",
-    "lab",
-    "presentation",
-    "study",
-    "review",
-    "analysis",
-    "proposal",
-]
+ledger.init_db()
 
 # Nag state for test
 unacknowledged_overdue: set = set()
@@ -166,15 +146,6 @@ def get_overdue_tether_events():
         if e.get("end", {}).get("dateTime"):
             overdue.append(e)
     return overdue
-
-
-def infer_complexity(task_title: str) -> int:
-    title = task_title.lower()
-    if any(w in title for w in COMPLEXITY_HIGH):
-        return 3
-    if any(w in title for w in COMPLEXITY_MED):
-        return 2
-    return 1
 
 
 def priority_score(event: dict) -> float:
@@ -393,7 +364,32 @@ async def weekly_queue_summary():
             suffix += ")_"
         prefix = "🔴" if i == 0 else "•"
         lines.append(f"{prefix} {name} — due {date_str}{suffix}")
+    retro = ledger.retro_lines()
+    if retro:
+        lines.append("")
+        lines.extend(retro)
     await dm_user("\n".join(lines))
+
+
+async def test_retro():
+    """DMs just the ledger retrospective block."""
+    lines = ledger.retro_lines() or ["📈 History: ledger unavailable."]
+    await dm_user("\n".join(lines))
+
+
+async def test_sync():
+    """Dry-run Belki sync preview: no calendar writes, no state change."""
+    planned = []
+
+    def preview_insert(summary, start, end, origin=None, estimate=None, body_text=None, project=None):
+        planned.append(summary)
+        return {"id": f"dry{len(planned)}", "summary": summary, "start": {"dateTime": start}}
+
+    text, imported = belki_import.sync(
+        get_tether_deadlines(), preview_insert, dry_run=True
+    )
+    print(f"[SYNC DRY RUN] would import {imported} subtask(s)")
+    await dm_user(f"🧪 **Belki sync dry run:**\n{text}")
 
 
 async def test_nag():
@@ -461,6 +457,8 @@ JOBS = {
     "inactivity": inactivity_check,
     "queue": weekly_queue_summary,
     "nag": test_nag,
+    "retro": test_retro,
+    "sync": test_sync,
     "debug": debug_overdue,
 }
 

@@ -66,8 +66,8 @@ When a user marks a task as done:
 1. Call complete_task with the event ID
 2. The tool returns the remaining queue
 3. Immediately call list_upcoming_events
-4. Identify the next ⏰ deadline — if it has no focus blocks scheduled before it, proactively schedule them now
-5. Confirm to the user: what was completed, what's next, and what you just scheduled
+4. Identify the next ⏰ deadline
+5. Confirm to the user: what was completed and what's next
 
 ### Missing a task (deadline passed, not done)
 
