@@ -19,7 +19,7 @@ from googleapiclient.discovery import build
 
 import belki_import
 import ledger
-from ledger import clean_name, infer_complexity
+from ledger import infer_complexity
 
 # --- CONFIG (mirrors main.py) ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
