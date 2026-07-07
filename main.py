@@ -328,6 +328,8 @@ def task_matches(query: str, event: dict) -> bool:
         .lower()
     )
     q = query.lower().strip()
+    if not q:
+        return False
     return q == name or all(
         re.search(r"\b" + re.escape(word) + r"\b", name) for word in q.split()
     )
