@@ -28,7 +28,10 @@ TEST_MODE=true  # set in .env
 
 ## Architecture
 
-Single-file bot (`main.py`). No database — Google Calendar is the sole persistent state layer.
+Core bot in `main.py`; task lifecycle history in `ledger.py` (SQLite at `LEDGER_DB`, default `data/ledger.db`); Belki task import in `belki_import.py`. Google Calendar remains the scheduling source of truth — the ledger only records history (created/completed/pushed/kept/deleted/nag-ignored) for retrospective stats.
+
+**Belki import** (`belki_import.py`, `@Tether sync belki [project]` + morning auto-sync):
+Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount, read-only). Tasks are checkbox blocks with indented `key:: value` fields; only tasks with `project::` are importable. `estimate::` (integer evenings) drives capacity packing: each week holds `EVENINGS_PER_WEEK` (default 4) evenings, tasks pack onto Sundays in file order, a task without an estimate fills its whole week, a future `due::` is kept as a fixed date. Exactly one project is active at a time (`active_project` in ledger state) — set explicitly via `sync belki <name>`, never auto-picked.
 
 **Request flow:**
 1. Discord `on_message` fires when bot is `@mentioned`
@@ -60,6 +63,9 @@ DISCORD_BOT_TOKEN=
 DISCORD_USER_ID=
 MORNING_BRIEFING_ENABLED=true   # optional, defaults true
 TEST_MODE=false                 # optional, defaults false
+EVENINGS_PER_WEEK=4             # optional, weekly capacity for Belki packing
+BELKI_PATH=/app/belki           # optional, Belki vault mount
+LEDGER_DB=data/ledger.db        # optional, SQLite ledger path
 ```
 
 ## Required Files (not in git)
