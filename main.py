@@ -1053,6 +1053,17 @@ async def on_ready():
     except Exception as e:
         log(f"[LEDGER] backfill failed: {e}")
 
+    # Startup Belki sync: pick up tasks written to the vault since the last
+    # run. Silent unless something was actually imported — restarts must not
+    # DM "no active project" / "nothing to import" noise.
+    try:
+        text, imported = run_belki_sync()
+        log(f"[SYNC] startup: imported={imported}")
+        if imported:
+            await dm_user(text)
+    except Exception as e:
+        log(f"[SYNC] startup Belki sync failed: {e}")
+
     scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
 
     if TEST_MODE:
