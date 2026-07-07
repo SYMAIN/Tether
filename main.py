@@ -127,7 +127,19 @@ def get_calendar_service():
     return build("calendar", "v3", credentials=creds)
 
 
-service = get_calendar_service()
+_service = None
+
+
+def get_service():
+    # Lazy init: module-level init crashed the bot before Discord connected
+    # when credentials were missing, and cached a service that outlived token
+    # expiry (see 462dded).
+    global _service
+    if _service is None:
+        _service = get_calendar_service()
+    return _service
+
+
 ledger.init_db()
 
 
@@ -159,7 +171,7 @@ def _insert_deadline(
         "end": {"dateTime": end_time, "timeZone": "America/Toronto"},
         "colorId": "5",
     }
-    created = service.events().insert(calendarId="primary", body=event).execute()
+    created = get_service().events().insert(calendarId="primary", body=event).execute()
     ledger.record_created(created, origin=origin, estimate=estimate, project=project)
     return created
 
@@ -196,10 +208,10 @@ def update_event_meta(event_id: str, pushes: int):
 def delete_calendar_event(event_id: str):
     """Deletes a calendar event by its event ID."""
     try:
-        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        event = get_service().events().get(calendarId="primary", eventId=event_id).execute()
     except Exception:
         event = None
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    get_service().events().delete(calendarId="primary", eventId=event_id).execute()
     if event:
         ledger.record_deleted(event)
     return {"status": "deleted", "event_id": event_id}
@@ -285,10 +297,10 @@ def get_overdue_tether_events():
 def complete_task(event_id: str):
     """Marks a Tether deadline as done and signals the queue to advance."""
     try:
-        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+        event = get_service().events().get(calendarId="primary", eventId=event_id).execute()
     except Exception:
         event = None
-    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    get_service().events().delete(calendarId="primary", eventId=event_id).execute()
     if event:
         ledger.record_completed(event)
     remaining = get_tether_deadlines()
@@ -300,6 +312,24 @@ def complete_task(event_id: str):
             for e in remaining
         ],
     }
+
+
+def task_matches(query: str, event: dict) -> bool:
+    name = (
+        event.get("summary", "")
+        .replace(DEADLINE_PREFIX, "")
+        .replace("— DUE", "")
+        .strip()
+        .lower()
+    )
+    q = query.lower().strip()
+    if not q:
+        # An empty query must never match — all() over zero words is
+        # vacuously true and would match every event.
+        return False
+    return q == name or all(
+        re.search(r"\b" + re.escape(word) + r"\b", name) for word in q.split()
+    )
 
 
 # --- PRIORITY ENGINE ---
@@ -634,7 +664,7 @@ async def midnight_nag_persist():
         meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
         new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
         event["description"] = new_desc
-        service.events().update(calendarId="primary", eventId=eid, body=event).execute()
+        get_service().events().update(calendarId="primary", eventId=eid, body=event).execute()
         ledger.record_nag_ignored(event, nag_count)
         log(f"[MIDNIGHT] incremented nag_ignored on {event.get('summary')}")
     nag_count = 0
@@ -957,7 +987,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
     new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
     e["description"] = new_desc
 
-    service.events().update(calendarId="primary", eventId=event_id, body=e).execute()
+    get_service().events().update(calendarId="primary", eventId=event_id, body=e).execute()
     ledger.record_pushed(e, target_date, push_reason, "user_push", old_due=old_due)
     unacknowledged_overdue.discard(event_id)
     task_nag_counts.pop(event_id, None)
@@ -1219,7 +1249,7 @@ async def on_message(message):
                     .replace("— DUE", "")
                     .strip()
                 )
-                service.events().delete(calendarId="primary", eventId=e["id"]).execute()
+                get_service().events().delete(calendarId="primary", eventId=e["id"]).execute()
                 ledger.record_completed(e)
                 unacknowledged_overdue.discard(e["id"])
                 task_nag_counts.pop(e["id"], None)
