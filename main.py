@@ -873,15 +873,19 @@ def next_sunday_with_capacity(from_date, deadlines, need, exclude_event_id=None)
 def resolve_push_date(
     command: dict, event: dict, meta: dict, name: str, push_reason: str,
     current_queue: list, content: str,
-) -> str:
-    """Deterministic push-date precedence: explicit timeframe > estimate arithmetic > AI fallback."""
+) -> tuple[str, bool]:
+    """Deterministic push-date precedence: explicit timeframe > estimate arithmetic > AI fallback.
+
+    Returns (date, ai_defaulted) matching pick_push_date's contract; the flag is
+    only True when every model failed and the hardcoded 7-day fallback was used.
+    """
     today = datetime.datetime.now(TORONTO_TZ).date()
 
     target = command.get("target_date")
     if target:
         try:
             if datetime.date.fromisoformat(target) > today:
-                return target
+                return target, False
         except ValueError:
             pass
     delta = command.get("delta_days")
@@ -889,7 +893,7 @@ def resolve_push_date(
         try:
             delta = int(delta)
             if delta > 0:
-                return (today + datetime.timedelta(days=delta)).isoformat()
+                return (today + datetime.timedelta(days=delta)).isoformat(), False
         except (TypeError, ValueError):
             pass
 
@@ -901,7 +905,7 @@ def resolve_push_date(
             candidate = today + datetime.timedelta(days=est)
             return next_sunday_with_capacity(
                 candidate, current_queue, est, exclude_event_id=event.get("id")
-            )
+            ), False
         except (TypeError, ValueError):
             pass
 
@@ -939,7 +943,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
     name = clean_name(e["summary"])
 
     current_queue = get_tether_deadlines()
-    target_date = resolve_push_date(
+    target_date, date_fallback = resolve_push_date(
         command, e, meta, name, push_reason, current_queue, content
     )
 
