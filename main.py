@@ -13,6 +13,10 @@ from googleapiclient.discovery import build
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import belki_import
+import ledger
+from ledger import clean_name, infer_complexity, complexity_label
+
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 DEADLINE_PREFIX = "⏰"
@@ -68,9 +72,10 @@ def build_meta(
     origin="normal",
     nag_ignored=0,
     last_push_reason="",
+    estimate="",
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
-    return (
+    meta = (
         f"[TETHER_META]\n"
         f"pushes={pushes}\n"
         f"created_at={created_at or today}\n"
@@ -79,6 +84,9 @@ def build_meta(
         f"nag_ignored={nag_ignored}\n"
         f"last_push_reason={last_push_reason}\n"
     )
+    if estimate not in ("", None):
+        meta += f"estimate={estimate}\n"
+    return meta
 
 
 def log(entry: str):
@@ -103,21 +111,30 @@ def get_calendar_service():
 
 
 service = get_calendar_service()
+ledger.init_db()
 
 
 # --- CALENDAR TOOLS ---
-def create_calendar_event(
-    summary: str, start_time: str, end_time: str, origin: str = "normal"
+def _insert_deadline(
+    summary: str,
+    start_time: str,
+    end_time: str,
+    origin: str = "normal",
+    estimate: int | None = None,
+    body_text: str | None = None,
+    project: str | None = None,
 ):
-    """Creates a calendar event. Times must be ISO format (YYYY-MM-DDTHH:MM:SS)."""
+    """Internal insert used by both the Gemini tool and the Belki import."""
     # Hard override: Gemini sometimes passes midnight — force to 23:59
     if "T00:00:00" in start_time:
         date_part = start_time[:10]
         start_time = f"{date_part}T23:59:00"
         end_time = f"{date_part}T23:59:00"
-    meta = build_meta(origin=origin)
+    meta = build_meta(origin=origin, estimate=estimate if estimate is not None else "")
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
+    if body_text:
+        description += f"\n\n{body_text}"
     event = {
         "summary": summary,
         "description": description,
@@ -125,7 +142,16 @@ def create_calendar_event(
         "end": {"dateTime": end_time, "timeZone": "America/Toronto"},
         "colorId": "5",
     }
-    return service.events().insert(calendarId="primary", body=event).execute()
+    created = service.events().insert(calendarId="primary", body=event).execute()
+    ledger.record_created(created, origin=origin, estimate=estimate, project=project)
+    return created
+
+
+def create_calendar_event(
+    summary: str, start_time: str, end_time: str, origin: str = "normal"
+):
+    """Creates a calendar event. Times must be ISO format (YYYY-MM-DDTHH:MM:SS)."""
+    return _insert_deadline(summary, start_time, end_time, origin=origin)
 
 
 def update_event_meta(event_id: str, pushes: int):
@@ -152,7 +178,13 @@ def update_event_meta(event_id: str, pushes: int):
 
 def delete_calendar_event(event_id: str):
     """Deletes a calendar event by its event ID."""
+    try:
+        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    except Exception:
+        event = None
     service.events().delete(calendarId="primary", eventId=event_id).execute()
+    if event:
+        ledger.record_deleted(event)
     return {"status": "deleted", "event_id": event_id}
 
 
@@ -235,7 +267,13 @@ def get_overdue_tether_events():
 
 def complete_task(event_id: str):
     """Marks a Tether deadline as done and signals the queue to advance."""
+    try:
+        event = service.events().get(calendarId="primary", eventId=event_id).execute()
+    except Exception:
+        event = None
     service.events().delete(calendarId="primary", eventId=event_id).execute()
+    if event:
+        ledger.record_completed(event)
     remaining = get_tether_deadlines()
     return {
         "status": "completed",
@@ -248,53 +286,8 @@ def complete_task(event_id: str):
 
 
 # --- PRIORITY ENGINE ---
-COMPLEXITY_HIGH = [
-    "exam",
-    "final",
-    "midterm",
-    "thesis",
-    "dissertation",
-    "project",
-    "build",
-    "app",
-    "bot",
-    "feature",
-    "system",
-    "redesign",
-    "research",
-]
-COMPLEXITY_MED = [
-    "report",
-    "essay",
-    "assignment",
-    "lab",
-    "presentation",
-    "study",
-    "review",
-    "analysis",
-    "proposal",
-]
-COMPLEXITY_LOW = [
-    "email",
-    "reply",
-    "read",
-    "watch",
-    "call",
-    "meeting",
-    "form",
-    "submit",
-]
-
-
-def infer_complexity(task_title: str) -> int:
-    title = task_title.lower()
-    if any(w in title for w in COMPLEXITY_HIGH):
-        return 3
-    if any(w in title for w in COMPLEXITY_MED):
-        return 2
-    return 1
-
-
+# Complexity keyword lists and infer_complexity/complexity_label/clean_name
+# live in ledger.py (shared with test_jobs.py).
 def priority_score(event: dict) -> float:
     today = datetime.datetime.now(TORONTO_TZ).date()
     meta = parse_meta(event)
@@ -317,12 +310,6 @@ def priority_score(event: dict) -> float:
 
 def rank_deadlines(deadlines: list) -> list:
     return sorted(deadlines, key=priority_score)
-
-
-def complexity_label(score: int) -> str:
-    return {3: "high complexity", 2: "medium complexity", 1: "quick task"}.get(
-        score, "unknown"
-    )
 
 
 def priority_reason(event: dict) -> str:
@@ -408,7 +395,7 @@ Convert the user's message into a structured JSON command. Output ONLY the JSON 
 
 Schema:
 {{
-  "action": "schedule" | "push" | "complete" | "delete" | "list" | "next" | "query" | "keep" | "clarify",
+  "action": "schedule" | "push" | "complete" | "delete" | "list" | "next" | "query" | "keep" | "sync" | "clarify",
   "task_title": string | null,
   "urgency": "normal" | "asap",
   "target_date": "YYYY-MM-DD" | null,
@@ -428,6 +415,7 @@ Rules:
 - action "next": user asks what to work on next
 - action "list": user wants to see the queue
 - action "keep": user says keep, it's staying, I'll do it — acknowledges an overdue task without pushing
+- action "sync": user asks to sync/import tasks from Belki (e.g. "sync belki"). task_title = the project name if the user names one, else null
 - action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
 - push_reason: extract any reason or explanation the user gives for pushing — from "because <reason>", "since <reason>", or any explanation in the message. null if no reason given
 - urgency "asap": only if user says urgent / ASAP / emergency
@@ -623,6 +611,7 @@ async def midnight_nag_persist():
         new_desc = build_meta(**meta) + f"\nOriginally due: {original_due}"
         event["description"] = new_desc
         service.events().update(calendarId="primary", eventId=eid, body=event).execute()
+        ledger.record_nag_ignored(event, nag_count)
         log(f"[MIDNIGHT] incremented nag_ignored on {event.get('summary')}")
     nag_count = 0
     await dm_user(
@@ -716,6 +705,10 @@ async def weekly_queue_summary():
             suffix += ")_"
         prefix = "🔴" if i == 0 else "•"
         lines.append(f"{prefix} {name} — due {date_str}{suffix}")
+    retro = ledger.retro_lines()
+    if retro:
+        lines.append("")
+        lines.extend(retro)
     await dm_user("\n".join(lines))
 
 
@@ -761,12 +754,24 @@ async def already_dmed_today(keyword: str) -> bool:
     return False
 
 
+def run_belki_sync(project_override: str = None) -> tuple[str, int]:
+    return belki_import.sync(
+        get_tether_deadlines(), _insert_deadline, project_override=project_override
+    )
+
+
 async def run_morning_jobs():
     """Consolidated morning jobs with single dedup check."""
     if await already_dmed_today("Morning briefing"):
         return
     await morning_briefing()
     await deadline_warning()
+    try:
+        text, imported = run_belki_sync()
+        if imported:
+            await dm_user(text)
+    except Exception as e:
+        log(f"[SYNC] morning Belki sync failed: {e}")
 
 
 # --- PUSH VALIDATION ---
@@ -820,6 +825,56 @@ def pick_push_date(
     return fallback.strftime("%Y-%m-%d")
 
 
+def next_sunday_with_capacity(from_date, deadlines, need, exclude_event_id=None) -> str:
+    """First Sunday on/after from_date whose week can absorb `need` more evenings."""
+    others = [e for e in deadlines if e.get("id") != exclude_event_id]
+    usage = belki_import.week_usage(others)
+    d = from_date + datetime.timedelta(days=(6 - from_date.weekday()) % 7)
+    while True:
+        used = usage.get(d.isoformat(), 0)
+        if used == 0 or used + need <= belki_import.EVENINGS_PER_WEEK:
+            return d.isoformat()
+        d += datetime.timedelta(days=7)
+
+
+def resolve_push_date(
+    command: dict, event: dict, meta: dict, name: str, push_reason: str,
+    current_queue: list, content: str,
+) -> str:
+    """Deterministic push-date precedence: explicit timeframe > estimate arithmetic > AI fallback."""
+    today = datetime.datetime.now(TORONTO_TZ).date()
+
+    target = command.get("target_date")
+    if target:
+        try:
+            if datetime.date.fromisoformat(target) > today:
+                return target
+        except ValueError:
+            pass
+    delta = command.get("delta_days")
+    if delta:
+        try:
+            delta = int(delta)
+            if delta > 0:
+                return (today + datetime.timedelta(days=delta)).isoformat()
+        except (TypeError, ValueError):
+            pass
+
+    # Belki estimates are integer evenings; 1 evening ≈ 1 calendar day of runway
+    estimate = meta.get("estimate")
+    if estimate:
+        try:
+            est = int(estimate)
+            candidate = today + datetime.timedelta(days=est)
+            return next_sunday_with_capacity(
+                candidate, current_queue, est, exclude_event_id=event.get("id")
+            )
+        except (TypeError, ValueError):
+            pass
+
+    return pick_push_date(name, push_reason, current_queue, original_message=content)
+
+
 async def handle_push_with_reason(command: dict, content: str, message):
     task_title = command.get("task_title") or ""
     push_reason = command.get("push_reason", "")
@@ -847,11 +902,12 @@ async def handle_push_with_reason(command: dict, content: str, message):
     desc = e.get("description", "") or ""
     orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
     original_due = orig_match.group(1) if orig_match else e["start"]["dateTime"][:10]
-    name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+    old_due = e["start"]["dateTime"][:10]
+    name = clean_name(e["summary"])
 
     current_queue = get_tether_deadlines()
-    target_date = pick_push_date(
-        name, push_reason, current_queue, original_message=content
+    target_date = resolve_push_date(
+        command, e, meta, name, push_reason, current_queue, content
     )
 
     new_start = f"{target_date}T23:59:00"
@@ -865,6 +921,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
     e["description"] = new_desc
 
     service.events().update(calendarId="primary", eventId=event_id, body=e).execute()
+    ledger.record_pushed(e, target_date, push_reason, "user_push", old_due=old_due)
     unacknowledged_overdue.discard(event_id)
 
     await message.reply(
@@ -890,8 +947,9 @@ async def handle_keep(command: dict, message):
         return
     e = matches[0]
     event_id = e["id"]
-    name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+    name = clean_name(e["summary"])
     unacknowledged_overdue.discard(event_id)
+    ledger.record_kept(e)
     await message.reply(
         f"✅ Got it — **{name}** stays. I'll keep watching it.",
         mention_author=False,
@@ -908,7 +966,16 @@ async def on_ready():
     await asyncio.sleep(3)  # Give Discord state time to settle
 
     print(f"Tether is online as {bot.user}")
-    # ... rest of on_ready
+
+    try:
+        backfilled = ledger.backfill_from_events(
+            get_tether_deadlines() + get_overdue_tether_events(), parse_meta
+        )
+        if backfilled:
+            log(f"[LEDGER] backfilled {backfilled} existing task(s)")
+    except Exception as e:
+        log(f"[LEDGER] backfill failed: {e}")
+
     scheduler = AsyncIOScheduler(timezone=TORONTO_TZ)
 
     if TEST_MODE:
@@ -1028,6 +1095,14 @@ async def on_message(message):
                 await handle_keep(command, message)
                 return
 
+            # --- SYNC (Belki import) ---
+            if command.get("action") == "sync":
+                text, imported = run_belki_sync(command.get("task_title"))
+                log(f"[SYNC] imported={imported} | {text[:200]}")
+                for i in range(0, len(text), 2000):
+                    await message.reply(text[i : i + 2000], mention_author=False)
+                return
+
             # --- PUSH ---
             if command.get("action") == "push":
                 is_valid, error_msg = validate_push_command(command)
@@ -1094,6 +1169,7 @@ async def on_message(message):
                     .strip()
                 )
                 service.events().delete(calendarId="primary", eventId=e["id"]).execute()
+                ledger.record_completed(e)
                 unacknowledged_overdue.discard(e["id"])
                 remaining = get_tether_deadlines()
                 if remaining:

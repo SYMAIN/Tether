@@ -2,3 +2,5 @@
 token.json
 credentials.json
 tether.log
+data/
+__pycache__/

@@ -19,3 +19,9 @@ services:
             - ./token.json:/app/token.json
             - ./credentials.json:/app/credentials.json
             - ./tether.log:/app/tether.log
+            # SQLite ledger lives at /app/data/ledger.db (directory mount so
+            # Docker doesn't create a bogus directory in place of the file)
+            - ./data:/app/data
+            # Belki task files from the Obsidian vault, read-only
+            # (share the X: drive with Docker Desktop for this to resolve)
+            - "X:/Axiom Records/_belki_files:/app/belki:ro"
