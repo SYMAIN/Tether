@@ -825,17 +825,16 @@ def pick_push_date(
     return fallback.strftime("%Y-%m-%d")
 
 
-def next_free_sunday(from_date, deadlines, exclude_event_id=None) -> str:
-    """First Sunday on/after from_date whose slot holds no ⏰ deadline."""
-    taken = {
-        e["start"]["dateTime"][:10]
-        for e in deadlines
-        if e.get("id") != exclude_event_id and e.get("start", {}).get("dateTime")
-    }
+def next_sunday_with_capacity(from_date, deadlines, need, exclude_event_id=None) -> str:
+    """First Sunday on/after from_date whose week can absorb `need` more evenings."""
+    others = [e for e in deadlines if e.get("id") != exclude_event_id]
+    usage = belki_import.week_usage(others)
     d = from_date + datetime.timedelta(days=(6 - from_date.weekday()) % 7)
-    while d.isoformat() in taken:
+    while True:
+        used = usage.get(d.isoformat(), 0)
+        if used == 0 or used + need <= belki_import.EVENINGS_PER_WEEK:
+            return d.isoformat()
         d += datetime.timedelta(days=7)
-    return d.isoformat()
 
 
 def resolve_push_date(
@@ -865,9 +864,10 @@ def resolve_push_date(
     estimate = meta.get("estimate")
     if estimate:
         try:
-            candidate = today + datetime.timedelta(days=int(estimate))
-            return next_free_sunday(
-                candidate, current_queue, exclude_event_id=event.get("id")
+            est = int(estimate)
+            candidate = today + datetime.timedelta(days=est)
+            return next_sunday_with_capacity(
+                candidate, current_queue, est, exclude_event_id=event.get("id")
             )
         except (TypeError, ValueError):
             pass

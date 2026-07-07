@@ -39,13 +39,19 @@ Tether manages tasks as a Sunday-based deadline queue.
 
 New tasks are assigned to the next available Sunday slot.
 
+Belki-imported subtasks are packed into weeks by estimated evenings
+(`EVENINGS_PER_WEEK`, default 4) — several small subtasks share one Sunday
+instead of each consuming a week. Subtasks without an estimate fill their
+whole week.
+
 ### Urgent / ASAP Tasks
 
 Urgent tasks insert at the front of the queue and push existing deadlines back one week each.
 
 ### Completing Tasks
 
-Completing a task removes it and pulls all remaining deadlines forward.
+Completing a task removes it. Remaining deadlines stay where they are —
+finishing early is never punished by making the next deadline arrive sooner.
 
 ### Missed Tasks
 
@@ -135,6 +141,11 @@ Tether/
 GEMINI_API_KEY=your_key
 DISCORD_BOT_TOKEN=your_token
 DISCORD_USER_ID=your_discord_id
+
+# optional
+EVENINGS_PER_WEEK=4      # weekly capacity bucket for Belki subtask packing
+BELKI_PATH=/app/belki    # Belki project files (mounted read-only in Docker)
+LEDGER_DB=data/ledger.db # SQLite task-history ledger
 ```
 
 ---
@@ -200,7 +211,7 @@ For Windows startup automation:
 → ⚠️ Lab report moved to front. Bumped: Circuits exam → May 25.
 
 @Tether completed lab report
-→ Done. Circuits exam now due this Sunday.
+→ Done. Up next: Circuits exam — due May 25.
 ```
 
 ---

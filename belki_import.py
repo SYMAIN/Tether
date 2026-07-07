@@ -32,10 +32,12 @@ import ledger
 from ledger import clean_name
 
 BELKI_PATH = os.environ.get("BELKI_PATH", "/app/belki")
+EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "4"))
 
 _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
 _EST_RE = re.compile(r"est[:=]\s*(\d+)", re.IGNORECASE)
 _EST_STRIP_RE = re.compile(r"\(?\s*est[:=]\s*\d+\s*\)?", re.IGNORECASE)
+_META_EST_RE = re.compile(r"estimate=(\d+)")
 
 
 def parse_project_file(path: str) -> dict:
@@ -123,6 +125,36 @@ def _next_sunday_on_or_after(d: datetime.date) -> datetime.date:
     return d + datetime.timedelta(days=(6 - d.weekday()) % 7)
 
 
+def week_usage(deadlines: list) -> dict:
+    """Evenings already claimed per week, keyed by week-ending Sunday (ISO date).
+
+    A week is a capacity bucket of EVENINGS_PER_WEEK, not a single slot.
+    Events without an estimate= in their meta are legacy project-sized tasks
+    and conservatively fill their whole week.
+    """
+    usage: dict[str, int] = {}
+    for e in deadlines:
+        due = (e.get("start", {}) or {}).get("dateTime", "")[:10]
+        if not due:
+            continue
+        try:
+            week = _next_sunday_on_or_after(
+                datetime.date.fromisoformat(due)
+            ).isoformat()
+        except ValueError:
+            continue
+        m = _META_EST_RE.search(e.get("description", "") or "")
+        need = int(m.group(1)) if m else EVENINGS_PER_WEEK
+        usage[week] = usage.get(week, 0) + need
+    return usage
+
+
+def _fits(used: int, need: int) -> bool:
+    # An empty week always accepts a task, even an oversized one (it then
+    # owns the week); a non-empty week only accepts what fits in the bucket.
+    return used == 0 or used + need <= EVENINGS_PER_WEEK
+
+
 def sync(
     deadlines: list, insert_deadline, project_override: str = None, dry_run: bool = False
 ) -> tuple[str, int]:
@@ -193,11 +225,7 @@ def sync(
     switched = stored is not None and stored.lower() != active["name"].lower()
 
     today = datetime.datetime.now(ledger.TORONTO_TZ).date()
-    taken = {
-        e["start"]["dateTime"][:10]
-        for e in deadlines
-        if e.get("start", {}).get("dateTime")
-    }
+    usage = week_usage(deadlines)
     slot = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
 
     lines = []
@@ -208,7 +236,12 @@ def sync(
 
     imported = 0
     for st in new_tasks:
-        while slot.isoformat() in taken:
+        # Pack by estimated evenings: a week holds EVENINGS_PER_WEEK, not one
+        # task. The cursor only moves forward so Belki order (usually a
+        # dependency order) is preserved; a subtask with no estimate fills
+        # its whole week.
+        need = st["estimate"] if st["estimate"] is not None else EVENINGS_PER_WEEK
+        while not _fits(usage.get(slot.isoformat(), 0), need):
             slot += datetime.timedelta(days=7)
         due = slot.isoformat()
         insert_deadline(
@@ -220,18 +253,18 @@ def sync(
             body_text=st["description"] or None,
             project=active["name"],
         )
-        taken.add(due)
-        slot += datetime.timedelta(days=7)
+        usage[due] = usage.get(due, 0) + need
         imported += 1
         est_note = (
             f" (est: {st['estimate']} evening{'s' if st['estimate'] != 1 else ''})"
             if st["estimate"] is not None
-            else " (no estimate)"
+            else " (no estimate — fills its week)"
         )
         lines.append(f"• {st['name']} — due {due}{est_note}")
-        if st["estimate"] is not None and st["estimate"] > 7:
+        if st["estimate"] is not None and st["estimate"] > EVENINGS_PER_WEEK:
             lines.append(
-                f"  ⚠️ estimated {st['estimate']} evenings (>1 week) — consider splitting it in Belki."
+                f"  ⚠️ estimated {st['estimate']} evenings exceeds your weekly capacity "
+                f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
             )
 
     if active["skipped"]:
