@@ -29,7 +29,7 @@ Events you created. Always formatted as:
 1. ALWAYS call `list_upcoming_events` first — read the full current queue before acting
 2. Identify all existing ⏰ deadlines and their Sunday dates in order
 3. Never silently reschedule — always tell the user what changed
-4. Never double-book a Sunday slot
+4. Never double-book a Sunday slot with tasks you schedule yourself. (Belki-imported subtasks are capacity-packed and may share a Sunday — leave them as they are.)
 5. When pushing a task to a later Sunday, call `update_event_meta` with the event_id and incremented push count before rescheduling
 6. Detect uncertain language in the user's message — words like "maybe", "probably",
    "sometime", "I think", "not sure when", "eventually". If detected, DM a confirmation
@@ -66,8 +66,8 @@ When a user marks a task as done:
 1. Call complete_task with the event ID
 2. The tool returns the remaining queue
 3. Immediately call list_upcoming_events
-4. Identify the next ⏰ deadline — if it has no focus blocks scheduled before it, proactively schedule them now
-5. Confirm to the user: what was completed, what's next, and what you just scheduled
+4. Identify the next ⏰ deadline
+5. Confirm to the user: what was completed and what's next
 
 ### Missing a task (deadline passed, not done)
 
