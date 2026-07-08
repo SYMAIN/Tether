@@ -80,7 +80,12 @@ async def test_retro():
 
 
 async def test_nag():
-    """Runs 3 real nag cycles to verify escalation wording."""
+    """Runs 3 real nag cycles to verify escalation wording.
+
+    Each cycle also runs a real Belki sync (send_overdue_nag's own
+    reconciliation step) against the live vault and calendar — harmless
+    and idempotent, but not a pure mock.
+    """
     main.nag_count = 0
     main.unacknowledged_overdue.clear()
     main.task_nag_counts.clear()

@@ -621,6 +621,17 @@ async def dm_user(message: str):
 # --- NAG LOOP ---
 async def send_overdue_nag():
     global nag_count, unacknowledged_overdue, task_nag_counts
+    # Reconcile against Belki first: without this, a task marked done there
+    # keeps getting nagged for up to a day (until the next scheduled/manual
+    # sync) because this loop only ever looked at the calendar directly.
+    # Running it every cycle caps that staleness at 30 minutes.
+    try:
+        text, imported, completed = run_belki_sync()
+        if imported or completed:
+            await dm_user(text)
+    except Exception as e:
+        log(f"[SYNC] nag-cycle Belki sync failed: {e}")
+
     current_overdue = get_overdue_tether_events()
     current_ids = {e["id"] for e in current_overdue}
     unacknowledged_overdue = unacknowledged_overdue & current_ids

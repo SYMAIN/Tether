@@ -30,7 +30,7 @@ TEST_MODE=true  # set in .env
 
 Core bot in `main.py`; task lifecycle history in `ledger.py` (SQLite at `LEDGER_DB`, default `data/ledger.db`); Belki task import in `belki_import.py`. Google Calendar remains the scheduling source of truth — the ledger only records history (created/completed/pushed/kept/deleted/nag-ignored) for retrospective stats.
 
-**Belki import** (`belki_import.py`, `@Tether sync belki [project]` + auto-sync at startup and 09:00):
+**Belki import** (`belki_import.py`, `@Tether sync belki [project]` + auto-sync at startup, every 30 min via the nag cycle, and 09:00):
 Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount, read-only). Tasks are checkbox blocks with indented `key:: value` fields; only tasks with `project::` are importable. `estimate::` (integer evenings) drives capacity packing: each week holds `EVENINGS_PER_WEEK` (default 4) evenings, tasks pack onto Sundays in file order, a task without an estimate fills its whole week, a future `due::` is kept as a fixed date. Exactly one project is active at a time (`active_project` in ledger state) — set explicitly via `sync belki <name>`, never auto-picked. Sync is bidirectional: a task marked `- [x]` in Belki for the active project auto-completes and deletes its matching ⏰ calendar event (name match), so finishing work in Belki is enough — no separate `@Tether completed` needed.
 
 **Request flow:**
