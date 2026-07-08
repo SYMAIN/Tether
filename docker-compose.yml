@@ -19,6 +19,9 @@ services:
             - ./token.json:/app/token.json
             - ./credentials.json:/app/credentials.json
             - ./tether.log:/app/tether.log
+            # Scheduler system prompt: edit on host, then `docker-compose
+            # restart tether` picks it up — no rebuild (read at process start)
+            - ./agent.md:/app/agent.md:ro
             # SQLite ledger lives at /app/data/ledger.db (directory mount so
             # Docker doesn't create a bogus directory in place of the file)
             - ./data:/app/data

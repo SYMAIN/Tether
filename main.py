@@ -647,6 +647,7 @@ async def midnight_nag_persist():
     trim_log()
     if not unacknowledged_overdue:
         nag_count = 0
+        task_nag_counts.clear()
         return
     current_overdue = get_overdue_tether_events()
     event_map = {e["id"]: e for e in current_overdue}
@@ -1336,4 +1337,5 @@ async def on_message(message):
             )
 
 
-bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
+if __name__ == "__main__":
+    bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
