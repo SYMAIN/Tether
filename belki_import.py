@@ -26,6 +26,12 @@ ledger DB). It is chosen explicitly — `@Tether sync belki <name>` — and
 stays active while it has open tasks. Sync never switches projects on its
 own; with no active project it lists what's available instead of guessing.
 
+Sync is bidirectional: a task marked `- [x]` in Belki since the last sync
+is treated as completed and its ⏰ calendar event is deleted (via
+complete_deadline), so finishing work in a Claude Code / Belki session is
+enough — Discord never has to be told separately. This only reconciles the
+currently (or previously) active project, matched by cleaned task name.
+
 Parsing is lenient: unparseable lines are reported in the sync reply, never
 fatal. main.py injects its calendar functions into sync() — this module
 never talks to Google directly.
@@ -189,26 +195,60 @@ def _need(task: dict) -> int:
 
 
 def sync(
-    deadlines: list, insert_deadline, project_override: str = None, dry_run: bool = False
-) -> tuple[str, int]:
+    deadlines: list,
+    insert_deadline,
+    complete_deadline=None,
+    project_override: str = None,
+    dry_run: bool = False,
+) -> tuple[str, int, int]:
     """Imports the active project's new tasks, packing weeks by estimate.
+    Also completes any queued ⏰ event whose Belki task is now marked done.
 
-    deadlines: current ⏰ queue events (main.get_tether_deadlines()).
+    deadlines: current ⏰ queue events — should include overdue events too
+    (main.get_tether_deadlines() + main.get_overdue_tether_events()) so a
+    task finished late in Belki still gets cleared.
     insert_deadline: main._insert_deadline.
-    dry_run: don't persist the active-project switch (caller passes a
-    non-inserting insert_deadline too).
-    Returns (reply text, number imported).
+    complete_deadline: main.complete_task, or None to skip auto-completion
+    (e.g. dry runs never pass one).
+    dry_run: don't persist the active-project switch or complete anything
+    (caller passes a non-inserting insert_deadline too).
+    Returns (reply text, number imported, number auto-completed). Callers
+    that only fire a notification on activity must check both counts —
+    a sync that only clears finished Belki tasks has imported == 0.
     """
     if not os.path.isdir(BELKI_PATH):
-        return (f"⚠️ Belki folder not found at `{BELKI_PATH}`.", 0)
+        return (f"⚠️ Belki folder not found at `{BELKI_PATH}`.", 0, 0)
 
     tasks, skipped = load_tasks()
+    queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
+    queue_names = set(queue_by_name)
+    done_names = ledger.completed_names()
+    stored = ledger.get_state("active_project")
+
+    completed_lines: list[str] = []
+    if complete_deadline and not dry_run and stored:
+        belki_done = {
+            t["name"].lower()
+            for t in tasks
+            if t["project"]
+            and t["project"].lower() == stored.lower()
+            and t["done"]
+        }
+        for name_lower in belki_done & queue_names:
+            event = queue_by_name[name_lower]
+            complete_deadline(event["id"])
+            completed_lines.append(
+                f"✅ {clean_name(event.get('summary', ''))} — marked done in Belki, cleared."
+            )
+
+    def finish(text: str, imported: int) -> tuple[str, int, int]:
+        if completed_lines:
+            text = "\n".join(completed_lines) + "\n\n" + text
+        return text, imported, len(completed_lines)
+
     counts = open_project_counts(tasks)
     if not counts:
-        return ("⚠️ No open Belki tasks with a `project::` found in `Data/*.md`.", 0)
-
-    queue_names = {clean_name(e.get("summary", "")).lower() for e in deadlines}
-    done_names = ledger.completed_names()
+        return finish("⚠️ No open Belki tasks with a `project::` found in `Data/*.md`.", 0)
 
     def importable(pname: str) -> list[dict]:
         return [
@@ -221,20 +261,12 @@ def sync(
             and t["name"].lower() not in done_names
         ]
 
-    def in_queue(pname: str) -> bool:
-        return any(
-            t["name"].lower() in queue_names
-            for t in tasks
-            if t["project"] and t["project"].lower() == pname.lower()
-        )
-
     listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
-    stored = ledger.get_state("active_project")
     if project_override:
         needle = project_override.lower()
         matches = [p for p in counts if needle in p.lower()]
         if not matches:
-            return (f"No Belki project matching **{project_override}**. Available: {listing}.", 0)
+            return finish(f"No Belki project matching **{project_override}**. Available: {listing}.", 0)
         active = matches[0]
     else:
         active = next(
@@ -242,12 +274,12 @@ def sync(
         )
         if active is None:
             if stored:
-                return (
+                return finish(
                     f"✅ **{stored}** has no open Belki tasks left. Pick the next project "
                     f"with `@Tether sync belki <name>` — available: {listing}.",
                     0,
                 )
-            return (
+            return finish(
                 f"No active Belki project set. Pick one with `@Tether sync belki <name>` "
                 f"— available: {listing}.",
                 0,
@@ -263,7 +295,7 @@ def sync(
             if others
             else ""
         )
-        return (f"Nothing to import — **{active}** has no new tasks.{hint}", 0)
+        return finish(f"Nothing to import — **{active}** has no new tasks.{hint}", 0)
 
     switched = stored is not None and stored.lower() != active.lower()
 
@@ -334,4 +366,4 @@ def sync(
 
     if not dry_run:
         ledger.set_state("active_project", active)
-    return ("\n".join(lines), imported)
+    return finish("\n".join(lines), imported)

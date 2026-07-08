@@ -813,9 +813,15 @@ def already_ran_today(keyword: str) -> bool:
     return False
 
 
-def run_belki_sync(project_override: str = None) -> tuple[str, int]:
+def run_belki_sync(project_override: str = None) -> tuple[str, int, int]:
+    # Overdue events are included so a task finished late in Belki still
+    # gets auto-completed and cleared, not just on-time ones.
+    all_events = get_tether_deadlines() + get_overdue_tether_events()
     return belki_import.sync(
-        get_tether_deadlines(), _insert_deadline, project_override=project_override
+        all_events,
+        _insert_deadline,
+        complete_deadline=complete_task,
+        project_override=project_override,
     )
 
 
@@ -825,8 +831,8 @@ async def run_morning_jobs():
     await morning_briefing()
     await deadline_warning()
     try:
-        text, imported = run_belki_sync()
-        if imported:
+        text, imported, completed = run_belki_sync()
+        if imported or completed:
             await dm_user(text)
     except Exception as e:
         log(f"[SYNC] morning Belki sync failed: {e}")
@@ -1055,12 +1061,13 @@ async def on_ready():
         log(f"[LEDGER] backfill failed: {e}")
 
     # Startup Belki sync: pick up tasks written to the vault since the last
-    # run. Silent unless something was actually imported — restarts must not
-    # DM "no active project" / "nothing to import" noise.
+    # run, and clear anything marked done there. Silent unless something
+    # actually happened — restarts must not DM "no active project" /
+    # "nothing to import" noise.
     try:
-        text, imported = run_belki_sync()
-        log(f"[SYNC] startup: imported={imported}")
-        if imported:
+        text, imported, completed = run_belki_sync()
+        log(f"[SYNC] startup: imported={imported} completed={completed}")
+        if imported or completed:
             await dm_user(text)
     except Exception as e:
         log(f"[SYNC] startup Belki sync failed: {e}")
@@ -1194,8 +1201,8 @@ async def on_message(message):
 
             # --- SYNC (Belki import) ---
             if command.get("action") == "sync":
-                text, imported = run_belki_sync(command.get("task_title"))
-                log(f"[SYNC] imported={imported} | {text[:200]}")
+                text, imported, completed = run_belki_sync(command.get("task_title"))
+                log(f"[SYNC] imported={imported} completed={completed} | {text[:200]}")
                 for i in range(0, len(text), 2000):
                     await message.reply(text[i : i + 2000], mention_author=False)
                 return
