@@ -29,15 +29,15 @@ def test_sync():
     planned = []
 
     def preview_insert(summary, start, end, origin=None, estimate=None,
-                       body_text=None, project=None):
+                       body_text=None, project=None, belki_id=None):
         planned.append(summary)
         return {"id": f"dry{len(planned)}", "summary": summary,
                 "start": {"dateTime": start}}
 
-    text, imported, completed = belki_import.sync(
+    text, imported, completed, reconciled = belki_import.sync(
         main.get_tether_deadlines(), preview_insert, dry_run=True
     )
-    print(f"[SYNC DRY RUN] would import {imported} task(s), complete {completed}")
+    print(f"[SYNC DRY RUN] would import {imported} task(s), complete {completed}, reconcile {reconciled}")
     print(text)
 
 

@@ -25,6 +25,8 @@ services:
             # SQLite ledger lives at /app/data/ledger.db (directory mount so
             # Docker doesn't create a bogus directory in place of the file)
             - ./data:/app/data
-            # Belki task files from the Obsidian vault, read-only
-            # (share the X: drive with Docker Desktop for this to resolve)
-            - "X:/Axiom Records/_belki_files:/app/belki:ro"
+            # Belki task files from the Obsidian vault, read-only.
+            # Override BELKI_HOST_PATH in .env on hosts other than the
+            # Windows dev box (e.g. a cloud VM's local git checkout of the
+            # vault repo); defaults to the Windows share for local dev.
+            - "${BELKI_HOST_PATH:-X:/Axiom Records/_belki_files}:/app/belki:ro"

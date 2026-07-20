@@ -50,6 +50,8 @@ EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "4"))
 _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
 _FIELD_RE = re.compile(r"^\s+([A-Za-z_]+)::\s*(.*)$")
 _META_EST_RE = re.compile(r"estimate=(\d+)")
+_META_ID_RE = re.compile(r"belki_id=(\S+)")
+_META_BODY_RE = re.compile(r"Originally due: \d{4}-\d{2}-\d{2}\n\n(.*)", re.DOTALL)
 
 
 def parse_data_file(path: str) -> tuple[list[dict], list[str]]:
@@ -198,11 +200,13 @@ def sync(
     deadlines: list,
     insert_deadline,
     complete_deadline=None,
+    update_deadline=None,
     project_override: str = None,
     dry_run: bool = False,
-) -> tuple[str, int, int]:
+) -> tuple[str, int, int, int]:
     """Imports the active project's new tasks, packing weeks by estimate.
-    Also completes any queued ⏰ event whose Belki task is now marked done.
+    Also completes any queued ⏰ event whose Belki task is now marked done,
+    and reconciles renames/edits on tasks already tracked by belki_id.
 
     deadlines: current ⏰ queue events — should include overdue events too
     (main.get_tether_deadlines() + main.get_overdue_tether_events()) so a
@@ -210,20 +214,35 @@ def sync(
     insert_deadline: main._insert_deadline.
     complete_deadline: main.complete_task, or None to skip auto-completion
     (e.g. dry runs never pass one).
+    update_deadline: main.update_deadline_content, or None to skip
+    reconciliation (dry runs never pass one). Matching is by the belki_id
+    stamped into TETHER_META at import time — a task renamed or re-described
+    in Belki updates its existing event in place instead of leaving an
+    orphaned event and importing a duplicate under the new name.
     dry_run: don't persist the active-project switch or complete anything
     (caller passes a non-inserting insert_deadline too).
-    Returns (reply text, number imported, number auto-completed). Callers
-    that only fire a notification on activity must check both counts —
-    a sync that only clears finished Belki tasks has imported == 0.
+    Returns (reply text, number imported, number auto-completed, number
+    reconciled). Callers that only fire a notification on activity must
+    check all three counts — a sync that only clears finished Belki tasks,
+    or only reconciles a rename, has imported == 0.
     """
     if not os.path.isdir(BELKI_PATH):
-        return (f"⚠️ Belki folder not found at `{BELKI_PATH}`.", 0, 0)
+        return (f"⚠️ Belki folder not found at `{BELKI_PATH}`.", 0, 0, 0)
 
     tasks, skipped = load_tasks()
     queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
     queue_names = set(queue_by_name)
+    queue_by_id = {}
+    for e in deadlines:
+        m = _META_ID_RE.search(e.get("description", "") or "")
+        if m:
+            queue_by_id[m.group(1)] = e
     done_names = ledger.completed_names()
     stored = ledger.get_state("active_project")
+    today = datetime.datetime.now(ledger.TORONTO_TZ).date()
+
+    def is_fixed(t: dict) -> bool:
+        return bool(t["due"]) and datetime.date.fromisoformat(t["due"]) > today
 
     completed_lines: list[str] = []
     if complete_deadline and not dry_run and stored:
@@ -241,10 +260,10 @@ def sync(
                 f"✅ {clean_name(event.get('summary', ''))} — marked done in Belki, cleared."
             )
 
-    def finish(text: str, imported: int) -> tuple[str, int, int]:
+    def finish(text: str, imported: int, reconciled: int = 0) -> tuple[str, int, int, int]:
         if completed_lines:
             text = "\n".join(completed_lines) + "\n\n" + text
-        return text, imported, len(completed_lines)
+        return text, imported, len(completed_lines), reconciled
 
     counts = open_project_counts(tasks)
     if not counts:
@@ -259,6 +278,7 @@ def sync(
             and not t["done"]
             and t["name"].lower() not in queue_names
             and t["name"].lower() not in done_names
+            and not (t["id"] and t["id"] in queue_by_id)
         ]
 
     listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
@@ -285,6 +305,61 @@ def sync(
                 0,
             )
 
+    # Any belki_id-tracked event whose task no longer exists anywhere in
+    # Belki (line deleted outright, not marked `- [x]`) is left alone — the
+    # signal is too ambiguous to auto-delete on — but surfaced for review.
+    all_ids = {t["id"] for t in tasks if t["id"]}
+    vanished = [
+        clean_name(e.get("summary", ""))
+        for bid, e in queue_by_id.items()
+        if bid not in all_ids
+    ]
+    vanished_line = (
+        f"⚠️ {len(vanished)} previously-imported task(s) no longer found in Belki "
+        "(deleted, not marked done) — not auto-removed, review: " + ", ".join(vanished)
+        if vanished
+        else None
+    )
+
+    # Reconcile tasks already tracked by belki_id: a rename or a content/due
+    # edit updates the existing event in place instead of leaving it orphaned
+    # while a same-conceptual-task re-imports under its new name.
+    reconciled_lines: list[str] = []
+    if update_deadline and not dry_run:
+        for t in tasks:
+            if (
+                not t["id"]
+                or t["done"]
+                or not t["project"]
+                or t["project"].lower() != active.lower()
+            ):
+                continue
+            event = queue_by_id.get(t["id"])
+            if not event:
+                continue
+            cur_name = clean_name(event.get("summary", ""))
+            cur_desc = event.get("description", "") or ""
+            body_match = _META_BODY_RE.search(cur_desc)
+            cur_body = body_match.group(1).strip() if body_match else ""
+            cur_due = (event.get("start", {}) or {}).get("dateTime", "")[:10]
+            fixed = is_fixed(t)
+            want_due = t["due"] if fixed else cur_due
+            name_changed = cur_name.lower() != t["name"].lower()
+            desc_changed = cur_body != (t["description"] or "")
+            due_changed = fixed and want_due != cur_due
+            if not (name_changed or desc_changed or due_changed):
+                continue
+            new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
+            update_deadline(event["id"], new_summary, want_due, t["description"] or None, t["estimate"])
+            bits = []
+            if name_changed:
+                bits.append(f'renamed from "{cur_name}"')
+            if desc_changed:
+                bits.append("description updated")
+            if due_changed:
+                bits.append(f"due moved to {want_due}")
+            reconciled_lines.append(f"🔄 {t['name']} — {', '.join(bits)}")
+
     new_tasks = importable(active)
     if not new_tasks:
         others = [p for p in counts if p.lower() != active.lower() and importable(p)]
@@ -295,18 +370,18 @@ def sync(
             if others
             else ""
         )
-        return finish(f"Nothing to import — **{active}** has no new tasks.{hint}", 0)
+        pre_lines = reconciled_lines + ([vanished_line] if vanished_line else [])
+        prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
+        return finish(
+            f"{prefix}Nothing to import — **{active}** has no new tasks.{hint}",
+            0,
+            len(reconciled_lines),
+        )
 
     switched = stored is not None and stored.lower() != active.lower()
 
-    today = datetime.datetime.now(ledger.TORONTO_TZ).date()
     usage = week_usage(deadlines)
     slot = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
-
-    # Fixed-date tasks claim their week's capacity up front so packed tasks
-    # flow around them regardless of file order.
-    def is_fixed(t: dict) -> bool:
-        return bool(t["due"]) and datetime.date.fromisoformat(t["due"]) > today
 
     for t in new_tasks:
         if is_fixed(t):
@@ -318,6 +393,9 @@ def sync(
     lines = []
     if switched:
         lines.append(f"🔀 Active project switched to **{active}**.")
+    if reconciled_lines:
+        lines.extend(reconciled_lines)
+        lines.append("")
     lines.append(f"📥 Imported {len(new_tasks)} task(s) from **{active}**:")
 
     imported = 0
@@ -346,6 +424,7 @@ def sync(
             estimate=t["estimate"],
             body_text=t["description"] or None,
             project=active,
+            belki_id=t["id"],
         )
         imported += 1
         est_note = (
@@ -360,10 +439,13 @@ def sync(
                 f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
             )
 
+    if vanished_line:
+        lines.append(vanished_line)
+
     if skipped:
         lines.append("Skipped lines I couldn't parse:")
         lines.extend(f"  ✗ {s}" for s in skipped[:5])
 
     if not dry_run:
         ledger.set_state("active_project", active)
-    return finish("\n".join(lines), imported)
+    return finish("\n".join(lines), imported, len(reconciled_lines))

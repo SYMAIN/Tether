@@ -77,6 +77,7 @@ def build_meta(
     nag_ignored=0,
     last_push_reason="",
     estimate="",
+    belki_id="",
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = (
@@ -90,6 +91,8 @@ def build_meta(
     )
     if estimate not in ("", None):
         meta += f"estimate={estimate}\n"
+    if belki_id not in ("", None):
+        meta += f"belki_id={belki_id}\n"
     return meta
 
 
@@ -152,6 +155,7 @@ def _insert_deadline(
     estimate: int | None = None,
     body_text: str | None = None,
     project: str | None = None,
+    belki_id: str | None = None,
 ):
     """Internal insert used by both the Gemini tool and the Belki import."""
     # Hard override: Gemini sometimes passes midnight — force to 23:59
@@ -159,7 +163,11 @@ def _insert_deadline(
         date_part = start_time[:10]
         start_time = f"{date_part}T23:59:00"
         end_time = f"{date_part}T23:59:00"
-    meta = build_meta(origin=origin, estimate=estimate if estimate is not None else "")
+    meta = build_meta(
+        origin=origin,
+        estimate=estimate if estimate is not None else "",
+        belki_id=belki_id or "",
+    )
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
     if body_text:
@@ -203,6 +211,44 @@ def update_event_meta(event_id: str, pushes: int):
         calendarId="primary", eventId=event_id, body=event
     ).execute()
     return {"status": "updated", "pushes": pushes}
+
+
+def update_deadline_content(
+    event_id: str,
+    summary: str,
+    due_date: str,
+    body_text: str | None,
+    estimate: int | None,
+):
+    """Updates title/description/due date of a belki-tracked event in place.
+
+    Used when a Belki task is renamed or edited rather than recreated, so the
+    same calendar event (and its push history / belki_id) carries forward
+    instead of leaving an orphaned event behind and importing a duplicate.
+    """
+    event = get_service().events().get(calendarId="primary", eventId=event_id).execute()
+    meta = parse_meta(event)
+    desc = event.get("description", "") or ""
+    orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
+    original_due = orig_match.group(1) if orig_match else due_date
+
+    meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
+    if estimate is not None:
+        meta["estimate"] = estimate
+
+    description = build_meta(**meta)
+    description += f"\nOriginally due: {original_due}"
+    if body_text:
+        description += f"\n\n{body_text}"
+
+    event["summary"] = summary
+    event["description"] = description
+    event["start"] = {"dateTime": f"{due_date}T23:59:00", "timeZone": "America/Toronto"}
+    event["end"] = {"dateTime": f"{due_date}T23:59:00", "timeZone": "America/Toronto"}
+    get_service().events().update(
+        calendarId="primary", eventId=event_id, body=event
+    ).execute()
+    return {"status": "updated", "event_id": event_id}
 
 
 def delete_calendar_event(event_id: str):
@@ -626,8 +672,8 @@ async def send_overdue_nag():
     # sync) because this loop only ever looked at the calendar directly.
     # Running it every cycle caps that staleness at 30 minutes.
     try:
-        text, imported, completed = run_belki_sync()
-        if imported or completed:
+        text, imported, completed, reconciled = run_belki_sync()
+        if imported or completed or reconciled:
             await dm_user(text)
     except Exception as e:
         log(f"[SYNC] nag-cycle Belki sync failed: {e}")
@@ -824,7 +870,7 @@ def already_ran_today(keyword: str) -> bool:
     return False
 
 
-def run_belki_sync(project_override: str = None) -> tuple[str, int, int]:
+def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int]:
     # Overdue events are included so a task finished late in Belki still
     # gets auto-completed and cleared, not just on-time ones.
     all_events = get_tether_deadlines() + get_overdue_tether_events()
@@ -832,6 +878,7 @@ def run_belki_sync(project_override: str = None) -> tuple[str, int, int]:
         all_events,
         _insert_deadline,
         complete_deadline=complete_task,
+        update_deadline=update_deadline_content,
         project_override=project_override,
     )
 
@@ -842,8 +889,8 @@ async def run_morning_jobs():
     await morning_briefing()
     await deadline_warning()
     try:
-        text, imported, completed = run_belki_sync()
-        if imported or completed:
+        text, imported, completed, reconciled = run_belki_sync()
+        if imported or completed or reconciled:
             await dm_user(text)
     except Exception as e:
         log(f"[SYNC] morning Belki sync failed: {e}")
@@ -1076,9 +1123,9 @@ async def on_ready():
     # actually happened — restarts must not DM "no active project" /
     # "nothing to import" noise.
     try:
-        text, imported, completed = run_belki_sync()
-        log(f"[SYNC] startup: imported={imported} completed={completed}")
-        if imported or completed:
+        text, imported, completed, reconciled = run_belki_sync()
+        log(f"[SYNC] startup: imported={imported} completed={completed} reconciled={reconciled}")
+        if imported or completed or reconciled:
             await dm_user(text)
     except Exception as e:
         log(f"[SYNC] startup Belki sync failed: {e}")
@@ -1212,8 +1259,8 @@ async def on_message(message):
 
             # --- SYNC (Belki import) ---
             if command.get("action") == "sync":
-                text, imported, completed = run_belki_sync(command.get("task_title"))
-                log(f"[SYNC] imported={imported} completed={completed} | {text[:200]}")
+                text, imported, completed, reconciled = run_belki_sync(command.get("task_title"))
+                log(f"[SYNC] imported={imported} completed={completed} reconciled={reconciled} | {text[:200]}")
                 for i in range(0, len(text), 2000):
                     await message.reply(text[i : i + 2000], mention_author=False)
                 return

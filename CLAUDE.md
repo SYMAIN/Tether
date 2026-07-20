@@ -21,6 +21,8 @@ docker-compose logs -f tether
 docker-compose down
 ```
 
+**Deploy to a cloud VM (Oracle Always Free):** see `DEPLOYMENT.md`.
+
 **TEST_MODE** (fires all scheduled jobs 2 minutes after startup):
 ```
 TEST_MODE=true  # set in .env
@@ -33,6 +35,8 @@ Core bot in `main.py`; task lifecycle history in `ledger.py` (SQLite at `LEDGER_
 **Belki import** (`belki_import.py`, `@Tether sync belki [project]` + auto-sync at startup, every 30 min via the nag cycle, and 09:00):
 Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount, read-only). Tasks are checkbox blocks with indented `key:: value` fields; only tasks with `project::` are importable. `estimate::` (integer evenings) drives capacity packing: each week holds `EVENINGS_PER_WEEK` (default 4) evenings, tasks pack onto Sundays in file order, a task without an estimate fills its whole week, a future `due::` is kept as a fixed date. Exactly one project is active at a time (`active_project` in ledger state) — set explicitly via `sync belki <name>`, never auto-picked. Sync is bidirectional: a task marked `- [x]` in Belki for the active project auto-completes and deletes its matching ⏰ calendar event (name match), so finishing work in Belki is enough — no separate `@Tether completed` needed.
 
+Every imported event is stamped with the Belki task's `id::` as `belki_id` in `[TETHER_META]`. On each sync, any active-project task whose `id::` already matches a tracked event is reconciled by id (not name): a rename, a `description::` edit, or a due date that's newly gone fixed updates that event in place (`update_deadline_content`) instead of leaving the old event orphaned and importing a duplicate under the new name. A tracked `belki_id` that no longer appears anywhere in Belki (deleted outright, not checked off) is never auto-removed — just flagged in the sync reply for manual review, since a missing line is too ambiguous a signal to delete on.
+
 **Request flow:**
 1. Discord `on_message` fires when bot is `@mentioned`
 2. `parse_intent_with_fallback()` sends the message to Gemini to produce a structured JSON command (schema defined in `INTENT_PARSER_PROMPT`)
@@ -44,7 +48,7 @@ Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount
 - **Scheduler session** — stateful multi-turn chat, has function-calling tools, uses `agent.md` as its system prompt.
 
 **State in Calendar event descriptions:**
-Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`.
+Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`, plus `estimate` and `belki_id` on Belki-imported events.
 
 **Nag loop** (`send_overdue_nag`, fires every 30 min):
 - Tracks `unacknowledged_overdue` (in-memory set of event IDs) across the session
