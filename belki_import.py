@@ -321,10 +321,46 @@ def sync(
         else None
     )
 
+    # Backfill: events created before belki_id tracking existed (pre-2026-07-07)
+    # carry no belki_id, so the lookup above can never find them — any future
+    # rename permanently orphans them (old event stays stale, a duplicate
+    # imports under the new name) instead of updating in place. If a legacy
+    # event's title still matches a tracked task's current name, stamp the id
+    # (and estimate) onto it now, before it has a chance to drift. Already-
+    # orphaned events (title already changed) can't be recovered this way —
+    # their old title no longer matches anything and needs manual cleanup.
+    reconciled_lines: list[str] = []
+    if update_deadline and not dry_run:
+        for t in tasks:
+            if (
+                not t["id"]
+                or t["done"]
+                or not t["project"]
+                or t["project"].lower() != active.lower()
+                or t["id"] in queue_by_id
+            ):
+                continue
+            legacy_event = queue_by_name.get(clean_name(t["name"]).lower())
+            if not legacy_event or _META_ID_RE.search(legacy_event.get("description", "") or ""):
+                continue
+            legacy_desc = legacy_event.get("description", "") or ""
+            legacy_body_match = _META_BODY_RE.search(legacy_desc)
+            legacy_body = legacy_body_match.group(1).strip() if legacy_body_match else None
+            legacy_due = (legacy_event.get("start", {}) or {}).get("dateTime", "")[:10]
+            update_deadline(
+                legacy_event["id"],
+                legacy_event.get("summary", ""),
+                legacy_due,
+                legacy_body,
+                t["estimate"],
+                belki_id=t["id"],
+            )
+            queue_by_id[t["id"]] = legacy_event
+            reconciled_lines.append(f"🔧 {t['name']} — backfilled belki_id onto existing event")
+
     # Reconcile tasks already tracked by belki_id: a rename or a content/due
     # edit updates the existing event in place instead of leaving it orphaned
     # while a same-conceptual-task re-imports under its new name.
-    reconciled_lines: list[str] = []
     if update_deadline and not dry_run:
         for t in tasks:
             if (
@@ -350,7 +386,10 @@ def sync(
             if not (name_changed or desc_changed or due_changed):
                 continue
             new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
-            update_deadline(event["id"], new_summary, want_due, t["description"] or None, t["estimate"])
+            update_deadline(
+                event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
+                belki_id=t["id"],
+            )
             bits = []
             if name_changed:
                 bits.append(f'renamed from "{cur_name}"')

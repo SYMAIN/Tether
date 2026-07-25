@@ -37,6 +37,8 @@ Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount
 
 Every imported event is stamped with the Belki task's `id::` as `belki_id` in `[TETHER_META]`. On each sync, any active-project task whose `id::` already matches a tracked event is reconciled by id (not name): a rename, a `description::` edit, or a due date that's newly gone fixed updates that event in place (`update_deadline_content`) instead of leaving the old event orphaned and importing a duplicate under the new name. A tracked `belki_id` that no longer appears anywhere in Belki (deleted outright, not checked off) is never auto-removed — just flagged in the sync reply for manual review, since a missing line is too ambiguous a signal to delete on.
 
+Events created before `belki_id` tracking existed (pre-2026-07-07) carry no id at all, so the id lookup can never find them. Before the id-reconcile pass, a backfill step name-matches any such legacy event against a currently-untracked task's current title and stamps its `belki_id`/`estimate` in place — closing the gap prospectively for the *next* edit. It cannot recover an event that's already orphaned (title no longer matches anything current) — those need manual cleanup.
+
 **Request flow:**
 1. Discord `on_message` fires when bot is `@mentioned`
 2. `parse_intent_with_fallback()` sends the message to Gemini to produce a structured JSON command (schema defined in `INTENT_PARSER_PROMPT`)

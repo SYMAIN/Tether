@@ -219,12 +219,19 @@ def update_deadline_content(
     due_date: str,
     body_text: str | None,
     estimate: int | None,
+    belki_id: str | None = None,
 ):
     """Updates title/description/due date of a belki-tracked event in place.
 
     Used when a Belki task is renamed or edited rather than recreated, so the
     same calendar event (and its push history / belki_id) carries forward
     instead of leaving an orphaned event behind and importing a duplicate.
+
+    belki_id: stamps the id when the event doesn't already carry one — used
+    to backfill legacy (pre-belki_id) events so future edits can reconcile
+    against them instead of orphaning. parse_meta() already preserves an
+    existing belki_id line through the round-trip; this only matters for
+    events that don't have one yet.
     """
     event = get_service().events().get(calendarId="primary", eventId=event_id).execute()
     meta = parse_meta(event)
@@ -235,6 +242,8 @@ def update_deadline_content(
     meta["last_modified"] = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     if estimate is not None:
         meta["estimate"] = estimate
+    if belki_id:
+        meta["belki_id"] = belki_id
 
     description = build_meta(**meta)
     description += f"\nOriginally due: {original_due}"
