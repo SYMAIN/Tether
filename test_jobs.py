@@ -34,10 +34,13 @@ def test_sync():
         return {"id": f"dry{len(planned)}", "summary": summary,
                 "start": {"dateTime": start}}
 
-    text, imported, completed, reconciled = belki_import.sync(
+    text, imported, completed, reconciled, status = belki_import.sync(
         main.get_tether_deadlines(), preview_insert, dry_run=True
     )
-    print(f"[SYNC DRY RUN] would import {imported} task(s), complete {completed}, reconcile {reconciled}")
+    print(
+        f"[SYNC DRY RUN] would import {imported} task(s), complete {completed}, "
+        f"reconcile {reconciled} — status={status}"
+    )
     print(text)
 
 

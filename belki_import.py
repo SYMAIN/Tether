@@ -47,6 +47,28 @@ from ledger import clean_name
 BELKI_PATH = os.environ.get("BELKI_PATH", "/app/belki")
 EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "4"))
 
+# Health of a sync, so callers can tell a benign zero ("nothing new to
+# import") from a degraded one ("can't see Belki at all"). Both return
+# imported/completed/reconciled == 0, and for a week after the Oracle VM
+# cutover that ambiguity hid a dead sync completely: the ledger's
+# active_project was never carried over, every cycle bailed out at
+# STATUS_NO_ACTIVE_PROJECT, and nothing was ever said.
+STATUS_OK = "ok"
+STATUS_NO_BELKI_DIR = "no_belki_dir"
+STATUS_NO_TASKS = "no_tasks"
+STATUS_NO_ACTIVE_PROJECT = "no_active_project"
+# The active project finishing is a prompt, not a fault: the completion that
+# emptied it already DM'd, and that DM carries the "pick the next one" text.
+# Deliberately not in DEGRADED_STATUSES — repeating it daily until a new
+# project is chosen would be nagging about success.
+STATUS_PROJECT_DONE = "project_done"
+
+DEGRADED_STATUSES = (
+    STATUS_NO_BELKI_DIR,
+    STATUS_NO_TASKS,
+    STATUS_NO_ACTIVE_PROJECT,
+)
+
 _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
 _FIELD_RE = re.compile(r"^\s+([A-Za-z_]+)::\s*(.*)$")
 _META_EST_RE = re.compile(r"estimate=(\d+)")
@@ -203,7 +225,7 @@ def sync(
     update_deadline=None,
     project_override: str = None,
     dry_run: bool = False,
-) -> tuple[str, int, int, int]:
+) -> tuple[str, int, int, int, str]:
     """Imports the active project's new tasks, packing weeks by estimate.
     Also completes any queued ⏰ event whose Belki task is now marked done,
     and reconciles renames/edits on tasks already tracked by belki_id.
@@ -222,12 +244,20 @@ def sync(
     dry_run: don't persist the active-project switch or complete anything
     (caller passes a non-inserting insert_deadline too).
     Returns (reply text, number imported, number auto-completed, number
-    reconciled). Callers that only fire a notification on activity must
-    check all three counts — a sync that only clears finished Belki tasks,
-    or only reconciles a rename, has imported == 0.
+    reconciled, status). Callers that only fire a notification on activity
+    must check all three counts — a sync that only clears finished Belki
+    tasks, or only reconciles a rename, has imported == 0 — and must check
+    status too, or a sync that is failing outright looks identical to a
+    quiet one (see the STATUS_* constants).
     """
     if not os.path.isdir(BELKI_PATH):
-        return (f"⚠️ Belki folder not found at `{BELKI_PATH}`.", 0, 0, 0)
+        return (
+            f"⚠️ Belki folder not found at `{BELKI_PATH}`.",
+            0,
+            0,
+            0,
+            STATUS_NO_BELKI_DIR,
+        )
 
     tasks, skipped = load_tasks()
     queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
@@ -260,14 +290,24 @@ def sync(
                 f"✅ {clean_name(event.get('summary', ''))} — marked done in Belki, cleared."
             )
 
-    def finish(text: str, imported: int, reconciled: int = 0) -> tuple[str, int, int, int]:
+    def finish(
+        text: str, imported: int, reconciled: int = 0, status: str = STATUS_OK
+    ) -> tuple[str, int, int, int, str]:
         if completed_lines:
             text = "\n".join(completed_lines) + "\n\n" + text
-        return text, imported, len(completed_lines), reconciled
+        return text, imported, len(completed_lines), reconciled, status
 
     counts = open_project_counts(tasks)
     if not counts:
-        return finish("⚠️ No open Belki tasks with a `project::` found in `Data/*.md`.", 0)
+        # Surface `skipped` here: when the folder is mounted but empty (or the
+        # Data/ dir is missing entirely) that list holds the only clue why,
+        # and discarding it made this state undiagnosable from Discord alone.
+        detail = f" Parser notes: {'; '.join(skipped[:5])}" if skipped else ""
+        return finish(
+            "⚠️ No open Belki tasks with a `project::` found in `Data/*.md`." + detail,
+            0,
+            status=STATUS_NO_TASKS,
+        )
 
     def importable(pname: str) -> list[dict]:
         return [
@@ -298,12 +338,23 @@ def sync(
                     f"✅ **{stored}** has no open Belki tasks left. Pick the next project "
                     f"with `@Tether sync belki <name>` — available: {listing}.",
                     0,
+                    status=STATUS_PROJECT_DONE,
                 )
             return finish(
                 f"No active Belki project set. Pick one with `@Tether sync belki <name>` "
                 f"— available: {listing}.",
                 0,
+                status=STATUS_NO_ACTIVE_PROJECT,
             )
+
+    # Persist the selection the moment it resolves, not after a successful
+    # import. Every path below this can return early — most commonly
+    # "nothing to import", which is the normal state of a project whose
+    # tasks are all already queued — and persisting at the end meant an
+    # explicit `sync belki <name>` silently failed to stick in exactly that
+    # case, reverting to no-active-project on the next cycle.
+    if not dry_run:
+        ledger.set_state("active_project", active)
 
     # Any belki_id-tracked event whose task no longer exists anywhere in
     # Belki (line deleted outright, not marked `- [x]`) is left alone — the
@@ -343,20 +394,13 @@ def sync(
             legacy_event = queue_by_name.get(clean_name(t["name"]).lower())
             if not legacy_event or _META_ID_RE.search(legacy_event.get("description", "") or ""):
                 continue
-            legacy_desc = legacy_event.get("description", "") or ""
-            legacy_body_match = _META_BODY_RE.search(legacy_desc)
-            legacy_body = legacy_body_match.group(1).strip() if legacy_body_match else None
-            legacy_due = (legacy_event.get("start", {}) or {}).get("dateTime", "")[:10]
-            update_deadline(
-                legacy_event["id"],
-                legacy_event.get("summary", ""),
-                legacy_due,
-                legacy_body,
-                t["estimate"],
-                belki_id=t["id"],
-            )
+            # Register only — don't write here. The reconcile pass below is
+            # about to touch this same event and stamps belki_id itself, so
+            # writing now just means two Calendar writes and a doubled
+            # 🔧/🔄 pair in the reply for one logical change. Its `needs_id`
+            # check is what guarantees the stamp still happens when nothing
+            # else about the task differs.
             queue_by_id[t["id"]] = legacy_event
-            reconciled_lines.append(f"🔧 {t['name']} — backfilled belki_id onto existing event")
 
     # Reconcile tasks already tracked by belki_id: a rename or a content/due
     # edit updates the existing event in place instead of leaving it orphaned
@@ -383,7 +427,13 @@ def sync(
             name_changed = cur_name.lower() != t["name"].lower()
             desc_changed = cur_body != (t["description"] or "")
             due_changed = fixed and want_due != cur_due
-            if not (name_changed or desc_changed or due_changed):
+            # A legacy event registered by the backfill pass above carries no
+            # belki_id yet. Stamp it even when nothing else differs — that is
+            # the whole point of the backfill, and without this the id would
+            # only ever land on a task that happened to change in the same
+            # sync.
+            needs_id = not _META_ID_RE.search(cur_desc)
+            if not (name_changed or desc_changed or due_changed or needs_id):
                 continue
             new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
             update_deadline(
@@ -397,7 +447,10 @@ def sync(
                 bits.append("description updated")
             if due_changed:
                 bits.append(f"due moved to {want_due}")
-            reconciled_lines.append(f"🔄 {t['name']} — {', '.join(bits)}")
+            if needs_id:
+                bits.append("belki_id backfilled onto legacy event")
+            icon = "🔧" if needs_id else "🔄"
+            reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
 
     new_tasks = importable(active)
     if not new_tasks:
@@ -485,6 +538,4 @@ def sync(
         lines.append("Skipped lines I couldn't parse:")
         lines.extend(f"  ✗ {s}" for s in skipped[:5])
 
-    if not dry_run:
-        ledger.set_state("active_project", active)
     return finish("\n".join(lines), imported, len(reconciled_lines))

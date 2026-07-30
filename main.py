@@ -681,9 +681,7 @@ async def send_overdue_nag():
     # sync) because this loop only ever looked at the calendar directly.
     # Running it every cycle caps that staleness at 30 minutes.
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        if imported or completed or reconciled:
-            await dm_user(text)
+        await dm_sync_result(*run_belki_sync())
     except Exception as e:
         log(f"[SYNC] nag-cycle Belki sync failed: {e}")
 
@@ -879,10 +877,22 @@ def already_ran_today(keyword: str) -> bool:
     return False
 
 
-def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int]:
+def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int, str]:
+    global _service
     # Overdue events are included so a task finished late in Belki still
     # gets auto-completed and cleared, not just on-time ones.
-    all_events = get_tether_deadlines() + get_overdue_tether_events()
+    try:
+        all_events = get_tether_deadlines() + get_overdue_tether_events()
+    except OSError as e:
+        # get_service() caches an httplib2 connection for the life of the
+        # process and nothing ever reset it, so once the socket went stale on
+        # the idle VM every call raised [Errno 32] Broken pipe — three whole
+        # nag cycles skipped Belki reconciliation this way. Drop the cached
+        # service and try once more. No file I/O in scope, so OSError here is
+        # unambiguously a dead socket.
+        log(f"[SYNC] stale calendar connection ({e}) — reinitializing service, retrying")
+        _service = None
+        all_events = get_tether_deadlines() + get_overdue_tether_events()
     return belki_import.sync(
         all_events,
         _insert_deadline,
@@ -892,15 +902,38 @@ def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int]:
     )
 
 
+async def dm_sync_result(
+    text: str, imported: int, completed: int, reconciled: int, status: str
+):
+    """DMs a scheduled sync's result, but only when it's worth saying.
+
+    Activity — an import, an auto-completion, a reconcile — always reports.
+    A *degraded* sync reports at most once a day: it's a standing condition
+    rather than an event, and this runs every 30 minutes. Silence on a
+    healthy no-op is deliberate (restarts must not DM "nothing to import"),
+    but silence on a broken one is what hid a week-long outage after the VM
+    cutover — active_project was empty, every cycle returned zeros, and
+    nothing distinguished that from a quiet day.
+    """
+    if imported or completed or reconciled:
+        await dm_user(text)
+    elif status in belki_import.DEGRADED_STATUSES and not already_ran_today(
+        "[SYNC-DEGRADED]"
+    ):
+        log(f"[SYNC-DEGRADED] {status}")
+        await dm_user(
+            f"⚠️ Belki sync is degraded (`{status}`) — nothing is being imported "
+            f"or reconciled.\n{text}"
+        )
+
+
 async def run_morning_jobs():
     if already_ran_today("Morning briefing"):
         return
     await morning_briefing()
     await deadline_warning()
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        if imported or completed or reconciled:
-            await dm_user(text)
+        await dm_sync_result(*run_belki_sync())
     except Exception as e:
         log(f"[SYNC] morning Belki sync failed: {e}")
 
@@ -1132,10 +1165,12 @@ async def on_ready():
     # actually happened — restarts must not DM "no active project" /
     # "nothing to import" noise.
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        log(f"[SYNC] startup: imported={imported} completed={completed} reconciled={reconciled}")
-        if imported or completed or reconciled:
-            await dm_user(text)
+        result = run_belki_sync()
+        log(
+            f"[SYNC] startup: imported={result[1]} completed={result[2]} "
+            f"reconciled={result[3]} status={result[4]}"
+        )
+        await dm_sync_result(*result)
     except Exception as e:
         log(f"[SYNC] startup Belki sync failed: {e}")
 
@@ -1268,8 +1303,13 @@ async def on_message(message):
 
             # --- SYNC (Belki import) ---
             if command.get("action") == "sync":
-                text, imported, completed, reconciled = run_belki_sync(command.get("task_title"))
-                log(f"[SYNC] imported={imported} completed={completed} reconciled={reconciled} | {text[:200]}")
+                text, imported, completed, reconciled, status = run_belki_sync(
+                    command.get("task_title")
+                )
+                log(
+                    f"[SYNC] imported={imported} completed={completed} "
+                    f"reconciled={reconciled} status={status} | {text[:200]}"
+                )
                 for i in range(0, len(text), 2000):
                     await message.reply(text[i : i + 2000], mention_author=False)
                 return

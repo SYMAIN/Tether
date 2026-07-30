@@ -69,8 +69,13 @@ needs to be at least that fresh. Cron:
 ```bash
 crontab -e
 # add:
-*/15 * * * * cd /opt/tether/vault && git pull --quiet
+*/15 * * * * cd /opt/tether/vault && git pull >> /opt/tether/vault-pull.log 2>&1
 ```
+
+Log the output rather than `--quiet`. Ubuntu minimal has no MTA, so cron's
+mail goes nowhere — a pull that starts failing (expired deploy key, network,
+a rebased remote) would otherwise be completely invisible while Tether
+happily syncs against a frozen checkout.
 
 ## 5. Secrets
 
@@ -79,7 +84,20 @@ These never go through git. Copy from the Windows box via `scp`:
 ```bash
 # from X:\Dev\Tether on Windows (PowerShell / Git Bash):
 scp .env credentials.json token.json user@<vm-ip>:/opt/tether/app/
+scp data/ledger.db user@<vm-ip>:/opt/tether/app/data/
 ```
+
+**`data/ledger.db` is not optional.** It is gitignored, so a fresh VM builds an
+empty one and starts with an empty `state` table — which means
+`active_project` is unset, and `belki_import.sync()` bails out at "No active
+Belki project set" on *every* cycle. That path returns zero counts, and the
+scheduled callers only notify on a non-zero count, so Belki sync dies silently:
+no imports, no auto-completions, no `belki_id` backfill, no error. This is
+exactly what happened at the 2026-07-23 cutover and it went unnoticed for a
+week. The ledger's task history goes with it.
+
+The container writes this file as root, so copy it before the first
+`docker compose up` — after that, stop the container before replacing it.
 
 `token.json` is the already-authorized OAuth token — reuse it rather than
 running the browser consent flow on a headless VM. It's volume-mounted, so
