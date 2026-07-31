@@ -78,6 +78,7 @@ def build_meta(
     last_push_reason="",
     estimate="",
     belki_id="",
+    project="",
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = (
@@ -93,6 +94,11 @@ def build_meta(
         meta += f"estimate={estimate}\n"
     if belki_id not in ("", None):
         meta += f"belki_id={belki_id}\n"
+    # The queue spans several projects at once, so an event has to say which
+    # one it belongs to — for grouping in the summaries, and so completing it
+    # can be attributed to that project's velocity.
+    if project not in ("", None):
+        meta += f"project={project}\n"
     return meta
 
 
@@ -167,6 +173,7 @@ def _insert_deadline(
         origin=origin,
         estimate=estimate if estimate is not None else "",
         belki_id=belki_id or "",
+        project=project or "",
     )
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
@@ -220,6 +227,7 @@ def update_deadline_content(
     body_text: str | None,
     estimate: int | None,
     belki_id: str | None = None,
+    project: str | None = None,
 ):
     """Updates title/description/due date of a belki-tracked event in place.
 
@@ -244,6 +252,8 @@ def update_deadline_content(
         meta["estimate"] = estimate
     if belki_id:
         meta["belki_id"] = belki_id
+    if project:
+        meta["project"] = project
 
     description = build_meta(**meta)
     description += f"\nOriginally due: {original_due}"
@@ -767,7 +777,10 @@ async def morning_briefing():
         top = rank_deadlines(deadlines)[0]
         name = top["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         reason = priority_reason(top)
-        next_line = f"**Next up:** {name} — {reason}."
+        # Which project it belongs to matters now that the queue holds several.
+        tag = parse_meta(top).get("project")
+        label = f"[{tag}] {name}" if tag else name
+        next_line = f"**Next up:** {label} — {reason}."
 
     lines = ["📅 **Morning briefing**\n"]
     if overdue_lines:
@@ -819,6 +832,8 @@ async def weekly_queue_summary():
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         date_str = e["start"]["dateTime"][:10]
         meta = parse_meta(e)
+        if meta.get("project"):
+            name = f"[{meta['project']}] {name}"
         pushes = meta["pushes"]
         desc = e.get("description", "") or ""
         orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
@@ -830,6 +845,14 @@ async def weekly_queue_summary():
             suffix += ")_"
         prefix = "🔴" if i == 0 else "•"
         lines.append(f"{prefix} {name} — due {date_str}{suffix}")
+    try:
+        report = belki_import.project_report()
+    except Exception as e:
+        log(f"[SYNC] project report failed: {e}")
+        report = []
+    if report:
+        lines.append("")
+        lines.extend(report)
     retro = ledger.retro_lines()
     if retro:
         lines.append("")

@@ -21,16 +21,31 @@ packing (EVENINGS_PER_WEEK per week); a task without an estimate
 conservatively fills its whole week. A task with a future due:: keeps that
 exact date instead of being packed; a past due:: is repacked.
 
-Exactly one project is active at a time (state key 'active_project' in the
-ledger DB). It is chosen explicitly — `@Tether sync belki <name>` — and
-stays active while it has open tasks. Sync never switches projects on its
-own; with no active project it lists what's available instead of guessing.
+Several projects run at once. Each week's EVENINGS_PER_WEEK evenings are
+split across them by deadline pressure, read from a registry at
+BELKI_PATH/projects.md:
+
+    - Tiffy's Classroom
+      due:: 2026-11-01
+      status:: active
+
+A project's required rate is its open evenings over the weeks left until
+that date; the week's evenings are apportioned by that rate, capped at what
+each project actually has left, with the remainder going to undeadlined
+projects longest-untouched-first. The split is computed once and pinned for
+the week (state key 'allocation:<sunday>'), so finishing early leaves the
+week clear instead of pulling the next task into the gap.
+
+Forecasting uses measured output — ledger.velocity() — not the sum of open
+estimates. Tasks churn every session, so a burndown never converges and
+every project reads as doomed; the deadline sets the stakes and the
+completion history sets the rate.
 
 Sync is bidirectional: a task marked `- [x]` in Belki since the last sync
 is treated as completed and its ⏰ calendar event is deleted (via
 complete_deadline), so finishing work in a Claude Code / Belki session is
-enough — Discord never has to be told separately. This only reconciles the
-currently (or previously) active project, matched by cleaned task name.
+enough — Discord never has to be told separately. This covers every project
+in the queue, matched by cleaned task name.
 
 Parsing is lenient: unparseable lines are reported in the sync reply, never
 fatal. main.py injects its calendar functions into sync() — this module
@@ -38,6 +53,7 @@ never talks to Google directly.
 """
 
 import datetime
+import json
 import os
 import re
 
@@ -57,11 +73,6 @@ STATUS_OK = "ok"
 STATUS_NO_BELKI_DIR = "no_belki_dir"
 STATUS_NO_TASKS = "no_tasks"
 STATUS_NO_ACTIVE_PROJECT = "no_active_project"
-# The active project finishing is a prompt, not a fault: the completion that
-# emptied it already DM'd, and that DM carries the "pick the next one" text.
-# Deliberately not in DEGRADED_STATUSES — repeating it daily until a new
-# project is chosen would be nagging about success.
-STATUS_PROJECT_DONE = "project_done"
 
 DEGRADED_STATUSES = (
     STATUS_NO_BELKI_DIR,
@@ -70,9 +81,13 @@ DEGRADED_STATUSES = (
 )
 
 _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
+# Registry bullet: `- Project Name`, deliberately NOT a checkbox, so a task
+# line can never be mistaken for a project entry.
+_PROJECT_LINE_RE = re.compile(r"^- (?!\[)(.+)$")
 _FIELD_RE = re.compile(r"^\s+([A-Za-z_]+)::\s*(.*)$")
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
+_META_PROJECT_RE = re.compile(r"^project=(.+)$", re.M)
 _META_BODY_RE = re.compile(r"Originally due: \d{4}-\d{2}-\d{2}\n\n(.*)", re.DOTALL)
 
 
@@ -180,6 +195,283 @@ def open_project_counts(tasks: list[dict]) -> dict:
     return counts
 
 
+def parse_projects(path: str) -> dict:
+    """Parses the project registry at BELKI_PATH/projects.md.
+
+        - Tiffy's Classroom
+          due:: 2026-11-01
+          status:: active
+
+    Returns {name: {"due": date|None, "status": str}}. `due:: none` and a
+    missing due are both None — a project without a deadline still gets
+    worked on, it just can't generate deadline pressure.
+    """
+    out: dict[str, dict] = {}
+    has_fields: set[str] = set()
+    current: str | None = None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f.read().splitlines():
+            field = _FIELD_RE.match(line)
+            if field and current:
+                key, val = field.group(1).lower(), field.group(2).strip()
+                if key == "due":
+                    has_fields.add(current)
+                    try:
+                        out[current]["due"] = datetime.date.fromisoformat(val)
+                    except ValueError:
+                        out[current]["due"] = None  # "none", "tbd", junk
+                elif key == "status":
+                    has_fields.add(current)
+                    out[current]["status"] = val.lower()
+                continue
+            bullet = _PROJECT_LINE_RE.match(line)
+            if bullet:
+                current = bullet.group(1).strip()
+                out.setdefault(current, {"due": None, "status": "active"})
+                continue
+            if line.strip() and line[:1] not in (" ", "\t", "#"):
+                current = None
+    # An entry only counts if it actually carried due::/status::. This file is
+    # hand-edited and its header explains the fields using ordinary markdown
+    # bullets — without this, "- `due:: none` — no deadline..." registers a
+    # project literally named "`due:: none` — no deadline...".
+    return {k: v for k, v in out.items() if k in has_fields}
+
+
+def load_projects(belki_path: str = None) -> tuple[dict, str | None]:
+    """Registry + an optional note explaining why it's empty."""
+    path = os.path.join(belki_path or BELKI_PATH, "projects.md")
+    if not os.path.isfile(path):
+        return {}, f"(no projects.md at {path} — every project treated as active, no deadlines)"
+    try:
+        return parse_projects(path), None
+    except Exception as e:
+        return {}, f"(projects.md unreadable: {e})"
+
+
+def _registry(projects: dict, name: str) -> dict | None:
+    for k, v in projects.items():
+        if k.lower() == name.lower():
+            return v
+    return None
+
+
+def _largest_remainder(weights: dict, total: int) -> dict:
+    """Apportion `total` whole evenings across `weights` (Hamilton method).
+
+    Ties break by name so the same inputs always produce the same split —
+    an allocation that quietly reshuffles between syncs is unusable.
+    """
+    s = sum(weights.values())
+    if s <= 0 or total <= 0:
+        return {k: 0 for k in weights}
+    exact = {k: total * w / s for k, w in weights.items()}
+    out = {k: int(v) for k, v in exact.items()}
+    order = sorted(weights, key=lambda k: (-(exact[k] - out[k]), k))
+    for k in order[: total - sum(out.values())]:
+        out[k] += 1
+    return out
+
+
+def _neglect_order(names: list, last_activity) -> list:
+    """Longest-untouched first; never-touched first of all."""
+
+    def key(n):
+        d = last_activity(n) if last_activity else None
+        return (0 if d is None else 1, -(d or 0), n)
+
+    return sorted(names, key=key)
+
+
+def allocate_evenings(
+    projects: dict,
+    tasks: list,
+    today: datetime.date,
+    capacity: int = None,
+    last_activity=None,
+    min_units: dict = None,
+) -> tuple[dict, list]:
+    """Splits the coming week's evenings across projects by deadline pressure.
+
+    projects: registry from load_projects(). Advisory — a project with open
+    tasks but no registry entry is treated as active with no deadline, so
+    forgetting to register something never makes its work invisible.
+    last_activity: fn(project) -> days since that project last moved, or None
+    if it never has. Only orders projects that have no deadline to compete on.
+
+    Returns (allocation, lines). The lines explain the split and are meant to
+    be shown, not logged: pressure you can't interrogate is pressure you stop
+    believing.
+    """
+    capacity = EVENINGS_PER_WEEK if capacity is None else capacity
+    open_by_project: dict[str, list] = {}
+    for t in tasks:
+        if t["project"] and not t["done"]:
+            open_by_project.setdefault(t["project"], []).append(t)
+
+    eligible: dict[str, dict] = {}
+    for name, ts in open_by_project.items():
+        entry = _registry(projects, name)
+        if entry and entry.get("status", "active") != "active":
+            continue
+        eligible[name] = {
+            "remaining": sum(_need(t) for t in ts),
+            "due": (entry or {}).get("due"),
+        }
+    if not eligible:
+        return {}, []
+
+    lines: list[str] = []
+    required: dict[str, float] = {}
+    overdue: list[str] = []
+    for name, info in eligible.items():
+        if not info["due"]:
+            required[name] = 0.0
+            continue
+        days_left = (info["due"] - today).days
+        if days_left <= 0:
+            overdue.append(name)
+        # A past-due project doesn't get infinite pressure, it gets one
+        # week's worth — enough to dominate, not enough to divide by zero.
+        required[name] = info["remaining"] / (max(days_left, 1) / 7.0)
+
+    pressured = {k: v for k, v in required.items() if v > 0}
+    alloc = _largest_remainder(pressured, capacity) if pressured else {}
+    for k in list(alloc):
+        alloc[k] = min(alloc[k], eligible[k]["remaining"])
+
+    # Spare evenings go to whoever can still use them: deadline projects by
+    # pressure, then undeadlined ones by neglect.
+    order = sorted(pressured, key=lambda k: (-required[k], k)) + _neglect_order(
+        [k for k in eligible if k not in pressured], last_activity
+    )
+    # Round-robin, one evening at a time, rather than filling each project in
+    # turn. Filling greedily meant that with no deadlines set anywhere — the
+    # state this ships in — the alphabetically-first project swallowed the
+    # entire week and nothing else was ever scheduled.
+    leftover = capacity - sum(alloc.values())
+    while leftover > 0:
+        progressed = False
+        for k in order:
+            if leftover <= 0:
+                break
+            if alloc.get(k, 0) < eligible[k]["remaining"]:
+                alloc[k] = alloc.get(k, 0) + 1
+                leftover -= 1
+                progressed = True
+        if not progressed:
+            break  # everyone is at their remaining work; the week isn't full
+    alloc = {k: v for k, v in alloc.items() if v > 0}
+
+    # A slice smaller than the project's next task cannot be spent. Left
+    # as-is that project imports nothing, every week, forever — its share is
+    # allocated and then silently evaporates. Round each slice up to a
+    # spendable size in share order until the week runs out; whoever no
+    # longer fits waits for a week where they do.
+    if min_units:
+        rebuilt: dict[str, int] = {}
+        budget = capacity
+        starved: list[str] = []
+        for k in sorted(alloc, key=lambda k: (-alloc[k], -required.get(k, 0), k)):
+            unit = min_units.get(k) or 1
+            take = min(max(alloc[k], unit), eligible[k]["remaining"], budget)
+            if take >= unit:
+                rebuilt[k] = take
+                budget -= take
+            else:
+                starved.append(f"{k} (next task needs {unit} ev)")
+        if starved:
+            lines.append(
+                "⏸ No room this week for: " + ", ".join(sorted(starved)) + "."
+            )
+        # Evenings freed by a project that couldn't use them go back to the
+        # projects that can, rather than sitting idle for the week.
+        while budget > 0 and rebuilt:
+            progressed = False
+            for k in sorted(rebuilt, key=lambda k: (-required.get(k, 0), k)):
+                if budget <= 0:
+                    break
+                if rebuilt[k] < eligible[k]["remaining"]:
+                    rebuilt[k] += 1
+                    budget -= 1
+                    progressed = True
+            if not progressed:
+                break
+        alloc = rebuilt
+
+    committed = sum(required.values())
+    if committed > capacity:
+        lines.append(
+            f"⚠️ Deadlines commit you to **{committed:.1f} evenings/week** against a "
+            f"capacity of {capacity}. Something slips — move a date in `projects.md` "
+            f"or cut scope."
+        )
+    if overdue:
+        lines.append(f"🔴 Past its project deadline: {', '.join(sorted(overdue))}.")
+    for name in sorted(alloc, key=lambda k: (-alloc[k], k)):
+        info = eligible[name]
+        if info["due"]:
+            wk = max((info["due"] - today).days, 0) / 7.0
+            lines.append(
+                f"• **{name}** — {alloc[name]} ev · due {info['due']} ({wk:.1f} wks) · "
+                f"{info['remaining']} ev open · needs {required[name]:.1f}/wk"
+            )
+        else:
+            lines.append(
+                f"• **{name}** — {alloc[name]} ev · no deadline · "
+                f"{info['remaining']} ev open"
+            )
+    return alloc, lines
+
+
+def project_report(today: datetime.date = None) -> list:
+    """Per-project deadline vs measured rate, for the weekly summary.
+
+    Shows the required rate next to the observed one. A project is AT RISK
+    when it is producing slower than its deadline demands — which is a
+    statement about output, not about how many cards are open, so adding
+    tasks doesn't move it and finishing them does.
+    """
+    if not os.path.isdir(BELKI_PATH):
+        return []
+    tasks, _ = load_tasks()
+    projects, _note = load_projects()
+    today = today or datetime.datetime.now(ledger.TORONTO_TZ).date()
+
+    remaining: dict[str, int] = {}
+    for t in tasks:
+        if t["project"] and not t["done"]:
+            remaining[t["project"]] = remaining.get(t["project"], 0) + _need(t)
+    if not remaining:
+        return []
+
+    lines = ["📊 **Projects**"]
+    for name in sorted(remaining):
+        entry = _registry(projects, name)
+        if entry and entry.get("status", "active") != "active":
+            continue
+        observed = ledger.velocity(name)
+        due = (entry or {}).get("due")
+        if not due:
+            lines.append(
+                f"• **{name}** — {remaining[name]} ev open · no deadline · "
+                f"doing {observed}/wk"
+            )
+            continue
+        days_left = (due - today).days
+        need = remaining[name] / (max(days_left, 1) / 7.0)
+        flag = ""
+        if days_left <= 0:
+            flag = "  🔴 PAST DEADLINE"
+        elif observed < need:
+            flag = "  ⚠️ AT RISK"
+        lines.append(
+            f"• **{name}** — due {due} ({max(days_left, 0) / 7.0:.1f} wks) · "
+            f"{remaining[name]} ev open · needs {need:.1f}/wk, doing {observed}/wk{flag}"
+        )
+    return lines if len(lines) > 1 else []
+
+
 def _next_sunday_on_or_after(d: datetime.date) -> datetime.date:
     return d + datetime.timedelta(days=(6 - d.weekday()) % 7)
 
@@ -208,6 +500,88 @@ def week_usage(deadlines: list) -> dict:
     return usage
 
 
+def _project_week_usage(deadlines: list, project: str, week: str) -> int:
+    """Evenings a project already holds in one week.
+
+    Events predating the project= stamp aren't attributable and count as
+    nobody's — they still consume the week's total through week_usage(), they
+    just can't be charged against a project's budget until the reconcile pass
+    tags them.
+    """
+    used = 0
+    for e in deadlines:
+        due = (e.get("start", {}) or {}).get("dateTime", "")[:10]
+        if not due:
+            continue
+        try:
+            if _next_sunday_on_or_after(datetime.date.fromisoformat(due)).isoformat() != week:
+                continue
+        except ValueError:
+            continue
+        desc = e.get("description", "") or ""
+        m = _META_PROJECT_RE.search(desc)
+        if not m or m.group(1).strip().lower() != project.lower():
+            continue
+        est = _META_EST_RE.search(desc)
+        used += int(est.group(1)) if est else EVENINGS_PER_WEEK
+    return used
+
+
+def _week_key(week: datetime.date) -> str:
+    return f"allocation:{week.isoformat()}"
+
+
+def _week_allocation(
+    projects: dict,
+    tasks: list,
+    today: datetime.date,
+    week: datetime.date,
+    dry_run: bool,
+    deadlines: list,
+    min_units: dict = None,
+) -> tuple[dict, dict, list]:
+    """This week's evening split — computed once, then pinned for the week.
+
+    Returns (allocation, spent, lines).
+
+    Pinning is the point. Recomputing on every 30-minute sync would mean
+    finishing a task immediately pulls the next one into the same week, so
+    working faster just refills the slot and the deadline never moves — the
+    exact treadmill that made the old per-task due dates meaningless.
+
+    `spent` has to be *recorded* rather than measured off the live queue for
+    the same reason: completing a task deletes its event, so a queue-derived
+    figure drops and the freed evening is immediately handed to the next task.
+    Spend is a fact about the week, not about what's currently on the
+    calendar. Finishing early leaves the week genuinely clear.
+
+    A new week — or an explicit `sync belki <name>` — recomputes.
+    """
+    key = _week_key(week)
+    stored = ledger.get_state(key)
+    if stored:
+        try:
+            pinned = json.loads(stored)
+            if isinstance(pinned, dict) and pinned.get("alloc"):
+                return pinned["alloc"], dict(pinned.get("spent") or {}), []
+        except ValueError:
+            pass  # corrupt pin, recompute
+    alloc, lines = allocate_evenings(
+        projects,
+        tasks,
+        today,
+        last_activity=ledger.days_since_activity,
+        min_units=min_units,
+    )
+    # Seed spend from whatever this project already holds in the target week,
+    # so a mid-week first run tops up instead of double-booking.
+    week_iso = week.isoformat()
+    spent = {p: _project_week_usage(deadlines, p, week_iso) for p in alloc}
+    if alloc and not dry_run:
+        ledger.set_state(key, json.dumps({"alloc": alloc, "spent": spent}))
+    return alloc, spent, lines
+
+
 def _fits(used: int, need: int) -> bool:
     # An empty week always accepts a task, even an oversized one (it then
     # owns the week); a non-empty week only accepts what fits in the bucket.
@@ -226,7 +600,7 @@ def sync(
     project_override: str = None,
     dry_run: bool = False,
 ) -> tuple[str, int, int, int, str]:
-    """Imports the active project's new tasks, packing weeks by estimate.
+    """Schedules the coming week's work across projects by deadline pressure.
     Also completes any queued ⏰ event whose Belki task is now marked done,
     and reconciles renames/edits on tasks already tracked by belki_id.
 
@@ -241,8 +615,10 @@ def sync(
     stamped into TETHER_META at import time — a task renamed or re-described
     in Belki updates its existing event in place instead of leaving an
     orphaned event and importing a duplicate under the new name.
-    dry_run: don't persist the active-project switch or complete anything
-    (caller passes a non-inserting insert_deadline too).
+    project_override: an explicit `sync belki <name>` — hands the whole week
+    to that project and replaces whatever was pinned.
+    dry_run: don't pin the allocation or complete anything (caller passes a
+    non-inserting insert_deadline too).
     Returns (reply text, number imported, number auto-completed, number
     reconciled, status). Callers that only fire a notification on activity
     must check all three counts — a sync that only clears finished Belki
@@ -268,20 +644,19 @@ def sync(
         if m:
             queue_by_id[m.group(1)] = e
     done_names = ledger.completed_names()
-    stored = ledger.get_state("active_project")
+    projects, registry_note = load_projects()
     today = datetime.datetime.now(ledger.TORONTO_TZ).date()
 
     def is_fixed(t: dict) -> bool:
         return bool(t["due"]) and datetime.date.fromisoformat(t["due"]) > today
 
     completed_lines: list[str] = []
-    if complete_deadline and not dry_run and stored:
+    if complete_deadline and not dry_run:
+        # Every project, not just one: the queue now spans several at once, and
+        # scoping this to the single active project meant a task finished in
+        # Belki for any other project was never cleared from the calendar.
         belki_done = {
-            t["name"].lower()
-            for t in tasks
-            if t["project"]
-            and t["project"].lower() == stored.lower()
-            and t["done"]
+            t["name"].lower() for t in tasks if t["project"] and t["done"]
         }
         for name_lower in belki_done & queue_names:
             event = queue_by_name[name_lower]
@@ -322,39 +697,45 @@ def sync(
         ]
 
     listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
+    week = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
+
     if project_override:
         needle = project_override.lower()
         matches = [p for p in counts if needle in p.lower()]
         if not matches:
             return finish(f"No Belki project matching **{project_override}**. Available: {listing}.", 0)
-        active = matches[0]
-    else:
-        active = next(
-            (p for p in counts if stored and p.lower() == stored.lower()), None
-        )
-        if active is None:
-            if stored:
-                return finish(
-                    f"✅ **{stored}** has no open Belki tasks left. Pick the next project "
-                    f"with `@Tether sync belki <name>` — available: {listing}.",
-                    0,
-                    status=STATUS_PROJECT_DONE,
-                )
-            return finish(
-                f"No active Belki project set. Pick one with `@Tether sync belki <name>` "
-                f"— available: {listing}.",
-                0,
-                status=STATUS_NO_ACTIVE_PROJECT,
+        # Explicit override: the whole week goes to that project, and it
+        # replaces whatever was pinned. Asking for a project by name is an
+        # instruction, not a hint.
+        alloc = {matches[0]: EVENINGS_PER_WEEK}
+        spent = {matches[0]: 0}
+        alloc_lines = [
+            f"🎯 Override — the week's {EVENINGS_PER_WEEK} evenings go to **{matches[0]}**."
+        ]
+        if not dry_run:
+            ledger.set_state(
+                _week_key(week), json.dumps({"alloc": alloc, "spent": spent})
             )
+    else:
+        # Size of each project's next importable task, so the allocator never
+        # hands out a slice too small to schedule anything with.
+        min_units = {}
+        for pname in counts:
+            nxt = importable(pname)
+            if nxt:
+                min_units[pname] = _need(nxt[0])
+        alloc, spent, alloc_lines = _week_allocation(
+            projects, tasks, today, week, dry_run, deadlines, min_units=min_units
+        )
+    if registry_note and alloc_lines:
+        alloc_lines.append(registry_note)
 
-    # Persist the selection the moment it resolves, not after a successful
-    # import. Every path below this can return early — most commonly
-    # "nothing to import", which is the normal state of a project whose
-    # tasks are all already queued — and persisting at the end meant an
-    # explicit `sync belki <name>` silently failed to stick in exactly that
-    # case, reverting to no-active-project on the next cycle.
-    if not dry_run:
-        ledger.set_state("active_project", active)
+    if not alloc:
+        return finish(
+            f"No project has open Belki tasks to schedule. Available: {listing}.",
+            0,
+            status=STATUS_NO_ACTIVE_PROJECT,
+        )
 
     # Any belki_id-tracked event whose task no longer exists anywhere in
     # Belki (line deleted outright, not marked `- [x]`) is left alone — the
@@ -383,13 +764,10 @@ def sync(
     reconciled_lines: list[str] = []
     if update_deadline and not dry_run:
         for t in tasks:
-            if (
-                not t["id"]
-                or t["done"]
-                or not t["project"]
-                or t["project"].lower() != active.lower()
-                or t["id"] in queue_by_id
-            ):
+            # No project filter: the queue spans every project now, so what's
+            # in the queue defines the scope. Filtering to one project meant an
+            # event belonging to any other could never be repaired.
+            if not t["id"] or t["done"] or not t["project"] or t["id"] in queue_by_id:
                 continue
             legacy_event = queue_by_name.get(clean_name(t["name"]).lower())
             if not legacy_event or _META_ID_RE.search(legacy_event.get("description", "") or ""):
@@ -407,12 +785,7 @@ def sync(
     # while a same-conceptual-task re-imports under its new name.
     if update_deadline and not dry_run:
         for t in tasks:
-            if (
-                not t["id"]
-                or t["done"]
-                or not t["project"]
-                or t["project"].lower() != active.lower()
-            ):
+            if not t["id"] or t["done"] or not t["project"]:
                 continue
             event = queue_by_id.get(t["id"])
             if not event:
@@ -433,12 +806,18 @@ def sync(
             # only ever land on a task that happened to change in the same
             # sync.
             needs_id = not _META_ID_RE.search(cur_desc)
-            if not (name_changed or desc_changed or due_changed or needs_id):
+            # Same idea for project=: events predating the multi-project queue
+            # don't say which project they belong to, so they can't be grouped
+            # or credited to a project's velocity until this stamps them.
+            needs_project = not _META_PROJECT_RE.search(cur_desc)
+            if not (
+                name_changed or desc_changed or due_changed or needs_id or needs_project
+            ):
                 continue
             new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
             update_deadline(
                 event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
-                belki_id=t["id"],
+                belki_id=t["id"], project=t["project"],
             )
             bits = []
             if name_changed:
@@ -449,49 +828,64 @@ def sync(
                 bits.append(f"due moved to {want_due}")
             if needs_id:
                 bits.append("belki_id backfilled onto legacy event")
-            icon = "🔧" if needs_id else "🔄"
+            if needs_project:
+                bits.append(f"tagged to {t['project']}")
+            icon = "🔧" if (needs_id or needs_project) else "🔄"
             reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
 
-    new_tasks = importable(active)
+    # Pick this week's work: each project contributes tasks in Belki file
+    # order (usually a dependency order) until its evening budget is used up.
+    # A project already holding evenings in the target week has that counted
+    # against its budget, so a mid-week sync tops up rather than doubling.
+    week_key = week.isoformat()
+    new_tasks: list[tuple[dict, str]] = []
+    for pname in sorted(alloc, key=lambda p: (-alloc[p], p)):
+        used = spent.get(pname, 0)
+        for t in importable(pname):
+            if is_fixed(t):
+                # A hard date from Belki isn't the allocator's to move.
+                new_tasks.append((t, pname))
+                continue
+            need = _need(t)
+            if used + need > alloc[pname]:
+                break  # stop, don't skip — skipping would reorder the backlog
+            used += need
+            spent[pname] = used
+            new_tasks.append((t, pname))
+
     if not new_tasks:
-        others = [p for p in counts if p.lower() != active.lower() and importable(p)]
-        hint = (
-            " Other projects with importable tasks: "
-            + ", ".join(f"**{p}**" for p in others)
-            + ". Switch with `@Tether sync belki <name>`."
-            if others
-            else ""
+        pre_lines = alloc_lines + reconciled_lines + (
+            [vanished_line] if vanished_line else []
         )
-        pre_lines = reconciled_lines + ([vanished_line] if vanished_line else [])
         prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
         return finish(
-            f"{prefix}Nothing to import — **{active}** has no new tasks.{hint}",
+            f"{prefix}Nothing new to schedule — this week's evenings are already "
+            f"committed.",
             0,
             len(reconciled_lines),
         )
 
-    switched = stored is not None and stored.lower() != active.lower()
-
     usage = week_usage(deadlines)
-    slot = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
+    slot = week
 
-    for t in new_tasks:
+    for t, _ in new_tasks:
         if is_fixed(t):
-            week = _next_sunday_on_or_after(
+            wk = _next_sunday_on_or_after(
                 datetime.date.fromisoformat(t["due"])
             ).isoformat()
-            usage[week] = usage.get(week, 0) + _need(t)
+            usage[wk] = usage.get(wk, 0) + _need(t)
 
     lines = []
-    if switched:
-        lines.append(f"🔀 Active project switched to **{active}**.")
+    if alloc_lines:
+        lines.extend(alloc_lines)
+        lines.append("")
     if reconciled_lines:
         lines.extend(reconciled_lines)
         lines.append("")
-    lines.append(f"📥 Imported {len(new_tasks)} task(s) from **{active}**:")
+    lines.append(f"📥 Scheduled {len(new_tasks)} task(s) for the week of {week_key}:")
 
     imported = 0
-    for t in new_tasks:
+    for t, pname in new_tasks:
         # Pack by estimated evenings: a week holds EVENINGS_PER_WEEK, not one
         # task. The cursor only moves forward so Belki order (usually a
         # dependency order) is preserved; a task with no estimate fills its
@@ -515,7 +909,7 @@ def sync(
             origin="belki_import",
             estimate=t["estimate"],
             body_text=t["description"] or None,
-            project=active,
+            project=pname,
             belki_id=t["id"],
         )
         imported += 1
@@ -524,12 +918,18 @@ def sync(
             if t["estimate"] is not None
             else " (no estimate — fills its week)"
         )
-        lines.append(f"• {t['name']} — due {due}{est_note}{note}")
+        lines.append(f"• [{pname}] {t['name']} — due {due}{est_note}{note}")
         if t["estimate"] is not None and t["estimate"] > EVENINGS_PER_WEEK:
             lines.append(
                 f"  ⚠️ estimated {t['estimate']} evenings exceeds your weekly capacity "
                 f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
             )
+
+    # Record the spend against the week. Without this the next sync would
+    # re-derive it from the calendar, where a completed task has vanished —
+    # and the evening it used would be handed straight to the next task.
+    if imported and not dry_run:
+        ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
 
     if vanished_line:
         lines.append(vanished_line)

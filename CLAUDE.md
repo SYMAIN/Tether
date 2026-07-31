@@ -33,7 +33,14 @@ TEST_MODE=true  # set in .env
 Core bot in `main.py`; task lifecycle history in `ledger.py` (SQLite at `LEDGER_DB`, default `data/ledger.db`); Belki task import in `belki_import.py`. Google Calendar remains the scheduling source of truth — the ledger only records history (created/completed/pushed/kept/deleted/nag-ignored) for retrospective stats.
 
 **Belki import** (`belki_import.py`, `@Tether sync belki [project]` + auto-sync at startup, every 30 min via the nag cycle, and 09:00):
-Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount, read-only). Tasks are checkbox blocks with indented `key:: value` fields; only tasks with `project::` are importable. `estimate::` (integer evenings) drives capacity packing: each week holds `EVENINGS_PER_WEEK` (default 4) evenings, tasks pack onto Sundays in file order, a task without an estimate fills its whole week, a future `due::` is kept as a fixed date. Exactly one project is active at a time (`active_project` in ledger state) — set explicitly via `sync belki <name>`, never auto-picked. Sync is bidirectional: a task marked `- [x]` in Belki for the active project auto-completes and deletes its matching ⏰ calendar event (name match), so finishing work in Belki is enough — no separate `@Tether completed` needed.
+Reads monthly task files from `BELKI_PATH/Data/YYYY-MM.md` (Obsidian vault mount, read-only). Tasks are checkbox blocks with indented `key:: value` fields; only tasks with `project::` are importable. `estimate::` is integer evenings; a task without one fills its whole week, and a future `due::` is kept as a fixed date. Sync is bidirectional: a task marked `- [x]` in Belki auto-completes and deletes its matching ⏰ calendar event (name match) — for **every** project in the queue — so finishing work in Belki is enough, no separate `@Tether completed` needed.
+
+**Project-deadline scheduling** (replaced the single sticky `active_project` on 2026-07-30):
+Several projects run at once. `BELKI_PATH/projects.md` is a registry of `- <name>` bullets with `due::` and `status::` fields (an entry only counts if it carries at least one — the file's own header uses markdown bullets to document the fields). Each week's `EVENINGS_PER_WEEK` evenings are split across projects by **deadline pressure**: a project's required rate is its open evenings over the weeks left until `due::`, apportioned by largest-remainder, capped at what it actually has left, with the remainder going round-robin to undeadlined projects longest-untouched-first. A slice smaller than the project's next task is rounded up to a spendable size — otherwise that project imports nothing every week while still consuming its share.
+
+The split is **computed once and pinned** for the week (`allocation:<sunday>` in ledger state, holding both `alloc` and `spent`). Spend is recorded at import, never re-derived from the calendar: completing a task deletes its event, so a queue-derived figure would drop and immediately hand the freed evening to the next task. That treadmill is what made per-task due dates meaningless. Finishing early leaves the week clear; a new week (or an explicit `sync belki <name>`, which hands the whole week to one project) recomputes.
+
+Forecasting uses **measured output** — `ledger.velocity(project)` over completed rows — not the sum of open estimates. Tasks churn every session, so a burndown never converges and every project reads as doomed. The deadline sets the stakes; completion history sets the rate. `weekly_queue_summary` shows required vs observed per project and flags AT RISK.
 
 Every imported event is stamped with the Belki task's `id::` as `belki_id` in `[TETHER_META]`. On each sync, any active-project task whose `id::` already matches a tracked event is reconciled by id (not name): a rename, a `description::` edit, or a due date that's newly gone fixed updates that event in place (`update_deadline_content`) instead of leaving the old event orphaned and importing a duplicate under the new name. A tracked `belki_id` that no longer appears anywhere in Belki (deleted outright, not checked off) is never auto-removed — just flagged in the sync reply for manual review, since a missing line is too ambiguous a signal to delete on.
 
@@ -50,7 +57,7 @@ Events created before `belki_id` tracking existed (pre-2026-07-07) carry no id a
 - **Scheduler session** — stateful multi-turn chat, has function-calling tools, uses `agent.md` as its system prompt.
 
 **State in Calendar event descriptions:**
-Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`, plus `estimate` and `belki_id` on Belki-imported events.
+Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`, plus `estimate`, `belki_id` and `project` on Belki-imported events. Events predating a field carry none; the reconcile pass in `belki_import.sync()` stamps `belki_id`/`project` onto them in place (`needs_id` / `needs_project`) the first time their title still matches a live Belki task.
 
 **Nag loop** (`send_overdue_nag`, fires every 30 min):
 - Tracks `unacknowledged_overdue` (in-memory set of event IDs) across the session
@@ -69,7 +76,7 @@ DISCORD_BOT_TOKEN=
 DISCORD_USER_ID=
 MORNING_BRIEFING_ENABLED=true   # optional, defaults true
 TEST_MODE=false                 # optional, defaults false
-EVENINGS_PER_WEEK=4             # optional, weekly capacity for Belki packing
+EVENINGS_PER_WEEK=4             # optional, weekly capacity split across projects
 BELKI_PATH=/app/belki           # optional, Belki vault mount
 LEDGER_DB=data/ledger.db        # optional, SQLite ledger path
 ```
