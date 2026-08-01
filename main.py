@@ -103,8 +103,12 @@ def build_meta(
 
 
 def log(entry: str):
+    # encoding is explicit everywhere in this file: the log carries the emoji
+    # from every DM (⏰ 📅 ✅ 🔧), so on a host whose default isn't UTF-8 —
+    # Windows is cp1252 — both writing and reading it raise. The container is
+    # UTF-8 so this never bites in production, only when running locally.
     timestamp = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d %H:%M")
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {entry}\n")
 
 
@@ -114,10 +118,10 @@ def trim_log():
     cutoff = (
         datetime.datetime.now(TORONTO_TZ) - datetime.timedelta(days=LOG_RETENTION_DAYS)
     ).strftime("%Y-%m-%d")
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
     kept = [l for l in lines if not l.startswith("[") or l[1:11] >= cutoff]
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.writelines(kept)
 
 
@@ -129,7 +133,7 @@ def get_calendar_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open("token.json", "w") as token:
+            with open("token.json", "w", encoding="utf-8") as token:
                 token.write(creds.to_json())
         else:
             raise Exception("No valid credentials.")
@@ -499,7 +503,7 @@ def nag_summary_header(nag_count: int) -> str:
 # --- INTENT PARSER ---
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-with open("agent.md", "r") as f:
+with open("agent.md", "r", encoding="utf-8") as f:
     AGENT_INSTRUCTIONS = f.read()
 
 INTENT_PARSER_PROMPT = f"""You are an intent parser for a personal scheduling agent called Tether.
@@ -893,7 +897,7 @@ def already_ran_today(keyword: str) -> bool:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     if not os.path.exists(LOG_FILE):
         return False
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
         for line in f:
             if today in line and keyword in line:
                 return True
