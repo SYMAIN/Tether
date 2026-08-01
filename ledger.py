@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS state (
 def _log(entry: str):
     try:
         timestamp = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d %H:%M")
-        with open(LOG_FILE, "a") as f:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {entry}\n")
     except Exception:
         pass
@@ -240,9 +240,36 @@ def record_pushed(event: dict, new_date: str, reason: str, origin: str, old_due=
     )
 
 
+_META_LINE_RE = {
+    "project": re.compile(r"^project=(.+)$", re.M),
+    "estimate": re.compile(r"^estimate=(\d+)$", re.M),
+}
+
+
+def _meta_field(event: dict, key: str):
+    """Reads one [TETHER_META] field straight off the event description.
+
+    ledger.py deliberately doesn't import main.parse_meta — the ledger must
+    stay importable on its own (`python ledger.py` is the smoke test).
+    """
+    m = _META_LINE_RE[key].search(event.get("description", "") or "")
+    return m.group(1).strip() if m else None
+
+
 def record_completed(event: dict):
+    # Carry project and estimate onto the completed row. Without them a
+    # completion can't be attributed, and velocity() — which is what makes
+    # project deadlines forecastable against real output rather than against
+    # a task list that churns every session — has nothing to measure.
+    extra = {}
+    project = _meta_field(event, "project")
+    estimate = _meta_field(event, "estimate")
+    if project:
+        extra["project"] = project
+    if estimate:
+        extra["estimate"] = int(estimate)
     eid, name, due = _event_fields(event)
-    record("completed", event_id=eid, task_name=name, due_date=due)
+    record("completed", event_id=eid, task_name=name, due_date=due, extra=extra or None)
 
 
 def record_kept(event: dict):
@@ -354,6 +381,61 @@ def completed_names() -> set:
             return {r[0] for r in rows}
     except Exception:
         return set()
+
+
+def _project_rows(actions: tuple, days: int) -> list:
+    """(ts, extra-dict) for rows in the window that carry a project tag."""
+    marks = ",".join("?" * len(actions))
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                f"SELECT ts, extra FROM task_events WHERE action IN ({marks}) "
+                "AND extra IS NOT NULL AND ts >= ?",
+                (*actions, _cutoff(days)),
+            ).fetchall()
+    except Exception:
+        return []
+    out = []
+    for ts, extra in rows:
+        try:
+            out.append((ts, json.loads(extra)))
+        except Exception:
+            continue
+    return out
+
+
+def velocity(project: str, days: int = 28) -> float:
+    """Evenings of work completed per week for a project.
+
+    Measured, not projected. This is the whole point of tracking it: summing
+    the estimates still open forecasts nothing when every session adds cards,
+    so the deadline sets the stakes and this sets the rate. A completion with
+    no estimate recorded counts as one evening.
+    """
+    total = 0
+    for _, extra in _project_rows(("completed",), days):
+        if (extra.get("project") or "").lower() == (project or "").lower():
+            total += extra.get("estimate") or 1
+    return round(total / (days / 7.0), 2)
+
+
+def days_since_activity(project: str, days: int = 180):
+    """Days since this project last moved, or None if it never has."""
+    newest = None
+    for ts, extra in _project_rows(("completed", "created", "pushed"), days):
+        if (extra.get("project") or "").lower() == (project or "").lower():
+            if newest is None or ts > newest:
+                newest = ts
+    if newest is None:
+        return None
+    try:
+        then = datetime.datetime.fromisoformat(newest)
+    except ValueError:
+        return None
+    now = datetime.datetime.now(TORONTO_TZ)
+    if then.tzinfo is None:
+        then = TORONTO_TZ.localize(then)
+    return max((now - then).days, 0)
 
 
 def weekly_counts(days: int = 7) -> dict:

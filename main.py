@@ -78,6 +78,7 @@ def build_meta(
     last_push_reason="",
     estimate="",
     belki_id="",
+    project="",
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = (
@@ -93,12 +94,21 @@ def build_meta(
         meta += f"estimate={estimate}\n"
     if belki_id not in ("", None):
         meta += f"belki_id={belki_id}\n"
+    # The queue spans several projects at once, so an event has to say which
+    # one it belongs to — for grouping in the summaries, and so completing it
+    # can be attributed to that project's velocity.
+    if project not in ("", None):
+        meta += f"project={project}\n"
     return meta
 
 
 def log(entry: str):
+    # encoding is explicit everywhere in this file: the log carries the emoji
+    # from every DM (⏰ 📅 ✅ 🔧), so on a host whose default isn't UTF-8 —
+    # Windows is cp1252 — both writing and reading it raise. The container is
+    # UTF-8 so this never bites in production, only when running locally.
     timestamp = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d %H:%M")
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{timestamp}] {entry}\n")
 
 
@@ -108,10 +118,10 @@ def trim_log():
     cutoff = (
         datetime.datetime.now(TORONTO_TZ) - datetime.timedelta(days=LOG_RETENTION_DAYS)
     ).strftime("%Y-%m-%d")
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
         lines = f.readlines()
     kept = [l for l in lines if not l.startswith("[") or l[1:11] >= cutoff]
-    with open(LOG_FILE, "w") as f:
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
         f.writelines(kept)
 
 
@@ -123,7 +133,7 @@ def get_calendar_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            with open("token.json", "w") as token:
+            with open("token.json", "w", encoding="utf-8") as token:
                 token.write(creds.to_json())
         else:
             raise Exception("No valid credentials.")
@@ -167,6 +177,7 @@ def _insert_deadline(
         origin=origin,
         estimate=estimate if estimate is not None else "",
         belki_id=belki_id or "",
+        project=project or "",
     )
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
@@ -220,6 +231,7 @@ def update_deadline_content(
     body_text: str | None,
     estimate: int | None,
     belki_id: str | None = None,
+    project: str | None = None,
 ):
     """Updates title/description/due date of a belki-tracked event in place.
 
@@ -244,6 +256,8 @@ def update_deadline_content(
         meta["estimate"] = estimate
     if belki_id:
         meta["belki_id"] = belki_id
+    if project:
+        meta["project"] = project
 
     description = build_meta(**meta)
     description += f"\nOriginally due: {original_due}"
@@ -489,7 +503,7 @@ def nag_summary_header(nag_count: int) -> str:
 # --- INTENT PARSER ---
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-with open("agent.md", "r") as f:
+with open("agent.md", "r", encoding="utf-8") as f:
     AGENT_INSTRUCTIONS = f.read()
 
 INTENT_PARSER_PROMPT = f"""You are an intent parser for a personal scheduling agent called Tether.
@@ -681,9 +695,7 @@ async def send_overdue_nag():
     # sync) because this loop only ever looked at the calendar directly.
     # Running it every cycle caps that staleness at 30 minutes.
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        if imported or completed or reconciled:
-            await dm_user(text)
+        await dm_sync_result(*run_belki_sync())
     except Exception as e:
         log(f"[SYNC] nag-cycle Belki sync failed: {e}")
 
@@ -769,7 +781,10 @@ async def morning_briefing():
         top = rank_deadlines(deadlines)[0]
         name = top["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         reason = priority_reason(top)
-        next_line = f"**Next up:** {name} — {reason}."
+        # Which project it belongs to matters now that the queue holds several.
+        tag = parse_meta(top).get("project")
+        label = f"[{tag}] {name}" if tag else name
+        next_line = f"**Next up:** {label} — {reason}."
 
     lines = ["📅 **Morning briefing**\n"]
     if overdue_lines:
@@ -821,6 +836,8 @@ async def weekly_queue_summary():
         name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
         date_str = e["start"]["dateTime"][:10]
         meta = parse_meta(e)
+        if meta.get("project"):
+            name = f"[{meta['project']}] {name}"
         pushes = meta["pushes"]
         desc = e.get("description", "") or ""
         orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
@@ -832,6 +849,14 @@ async def weekly_queue_summary():
             suffix += ")_"
         prefix = "🔴" if i == 0 else "•"
         lines.append(f"{prefix} {name} — due {date_str}{suffix}")
+    try:
+        report = belki_import.project_report()
+    except Exception as e:
+        log(f"[SYNC] project report failed: {e}")
+        report = []
+    if report:
+        lines.append("")
+        lines.extend(report)
     retro = ledger.retro_lines()
     if retro:
         lines.append("")
@@ -872,17 +897,29 @@ def already_ran_today(keyword: str) -> bool:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     if not os.path.exists(LOG_FILE):
         return False
-    with open(LOG_FILE, "r") as f:
+    with open(LOG_FILE, "r", encoding="utf-8") as f:
         for line in f:
             if today in line and keyword in line:
                 return True
     return False
 
 
-def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int]:
+def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int, str]:
+    global _service
     # Overdue events are included so a task finished late in Belki still
     # gets auto-completed and cleared, not just on-time ones.
-    all_events = get_tether_deadlines() + get_overdue_tether_events()
+    try:
+        all_events = get_tether_deadlines() + get_overdue_tether_events()
+    except OSError as e:
+        # get_service() caches an httplib2 connection for the life of the
+        # process and nothing ever reset it, so once the socket went stale on
+        # the idle VM every call raised [Errno 32] Broken pipe — three whole
+        # nag cycles skipped Belki reconciliation this way. Drop the cached
+        # service and try once more. No file I/O in scope, so OSError here is
+        # unambiguously a dead socket.
+        log(f"[SYNC] stale calendar connection ({e}) — reinitializing service, retrying")
+        _service = None
+        all_events = get_tether_deadlines() + get_overdue_tether_events()
     return belki_import.sync(
         all_events,
         _insert_deadline,
@@ -892,15 +929,38 @@ def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int]:
     )
 
 
+async def dm_sync_result(
+    text: str, imported: int, completed: int, reconciled: int, status: str
+):
+    """DMs a scheduled sync's result, but only when it's worth saying.
+
+    Activity — an import, an auto-completion, a reconcile — always reports.
+    A *degraded* sync reports at most once a day: it's a standing condition
+    rather than an event, and this runs every 30 minutes. Silence on a
+    healthy no-op is deliberate (restarts must not DM "nothing to import"),
+    but silence on a broken one is what hid a week-long outage after the VM
+    cutover — active_project was empty, every cycle returned zeros, and
+    nothing distinguished that from a quiet day.
+    """
+    if imported or completed or reconciled:
+        await dm_user(text)
+    elif status in belki_import.DEGRADED_STATUSES and not already_ran_today(
+        "[SYNC-DEGRADED]"
+    ):
+        log(f"[SYNC-DEGRADED] {status}")
+        await dm_user(
+            f"⚠️ Belki sync is degraded (`{status}`) — nothing is being imported "
+            f"or reconciled.\n{text}"
+        )
+
+
 async def run_morning_jobs():
     if already_ran_today("Morning briefing"):
         return
     await morning_briefing()
     await deadline_warning()
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        if imported or completed or reconciled:
-            await dm_user(text)
+        await dm_sync_result(*run_belki_sync())
     except Exception as e:
         log(f"[SYNC] morning Belki sync failed: {e}")
 
@@ -1132,10 +1192,12 @@ async def on_ready():
     # actually happened — restarts must not DM "no active project" /
     # "nothing to import" noise.
     try:
-        text, imported, completed, reconciled = run_belki_sync()
-        log(f"[SYNC] startup: imported={imported} completed={completed} reconciled={reconciled}")
-        if imported or completed or reconciled:
-            await dm_user(text)
+        result = run_belki_sync()
+        log(
+            f"[SYNC] startup: imported={result[1]} completed={result[2]} "
+            f"reconciled={result[3]} status={result[4]}"
+        )
+        await dm_sync_result(*result)
     except Exception as e:
         log(f"[SYNC] startup Belki sync failed: {e}")
 
@@ -1268,8 +1330,13 @@ async def on_message(message):
 
             # --- SYNC (Belki import) ---
             if command.get("action") == "sync":
-                text, imported, completed, reconciled = run_belki_sync(command.get("task_title"))
-                log(f"[SYNC] imported={imported} completed={completed} reconciled={reconciled} | {text[:200]}")
+                text, imported, completed, reconciled, status = run_belki_sync(
+                    command.get("task_title")
+                )
+                log(
+                    f"[SYNC] imported={imported} completed={completed} "
+                    f"reconciled={reconciled} status={status} | {text[:200]}"
+                )
                 for i in range(0, len(text), 2000):
                     await message.reply(text[i : i + 2000], mention_author=False)
                 return
