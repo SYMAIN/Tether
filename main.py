@@ -1022,11 +1022,21 @@ def pick_push_date(
     return fallback.strftime("%Y-%m-%d"), True
 
 
-def next_sunday_with_capacity(from_date, deadlines, need, exclude_event_id=None) -> str:
-    """First Sunday on/after from_date whose week can absorb `need` more evenings."""
+def next_available_date(from_date, deadlines, need, exclude_event_id=None) -> str:
+    """from_date itself, if its week has room for `need` more evenings; otherwise
+    the next Sunday-anchored week that does.
+
+    Weeks are capacity buckets keyed by their ending Sunday (belki_import.week_usage),
+    but a task doesn't need to land ON that Sunday to fit in the bucket — only a
+    week that's already full needs to spill into the following week's Sunday.
+    """
     others = [e for e in deadlines if e.get("id") != exclude_event_id]
     usage = belki_import.week_usage(others)
-    d = from_date + datetime.timedelta(days=(6 - from_date.weekday()) % 7)
+    bucket = from_date + datetime.timedelta(days=(6 - from_date.weekday()) % 7)
+    used = usage.get(bucket.isoformat(), 0)
+    if used == 0 or used + need <= belki_import.EVENINGS_PER_WEEK:
+        return from_date.isoformat()
+    d = bucket + datetime.timedelta(days=7)
     while True:
         used = usage.get(d.isoformat(), 0)
         if used == 0 or used + need <= belki_import.EVENINGS_PER_WEEK:
@@ -1067,7 +1077,7 @@ def resolve_push_date(
         try:
             est = int(estimate)
             candidate = today + datetime.timedelta(days=est)
-            return next_sunday_with_capacity(
+            return next_available_date(
                 candidate, current_queue, est, exclude_event_id=event.get("id")
             ), False
         except (TypeError, ValueError):
