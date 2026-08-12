@@ -707,12 +707,24 @@ async def dm_user(message: str):
 
 
 # --- NAG LOOP ---
+# 23:00-08:00 Toronto: the phone still lights up, just once an hour instead
+# of every 30 min. Reconciliation still runs every cycle either way (see
+# below) — this only throttles the DM itself.
+NIGHT_START_HOUR = 23
+NIGHT_END_HOUR = 8
+
+
+def _in_quiet_hours(now: datetime.datetime) -> bool:
+    return now.hour >= NIGHT_START_HOUR or now.hour < NIGHT_END_HOUR
+
+
 async def send_overdue_nag():
     global nag_count, unacknowledged_overdue, task_nag_counts
     # Reconcile against Belki first: without this, a task marked done there
     # keeps getting nagged for up to a day (until the next scheduled/manual
     # sync) because this loop only ever looked at the calendar directly.
-    # Running it every cycle caps that staleness at 30 minutes.
+    # Running it every cycle caps that staleness at 30 minutes. This always
+    # runs, even during quiet hours — only the nag DM itself is throttled.
     try:
         await dm_sync_result(*run_belki_sync())
     except Exception as e:
@@ -729,6 +741,15 @@ async def send_overdue_nag():
     pending = [event_map[eid] for eid in unacknowledged_overdue if eid in event_map]
     if not pending:
         return
+
+    now = datetime.datetime.now(TORONTO_TZ)
+    # The job itself still fires every 30 min (CronTrigger minute="*/30") so
+    # Belki reconciliation above stays on its normal cadence; overnight, only
+    # the top-of-the-hour tick actually sends, collapsing the nag DM to
+    # hourly without touching the scheduler's trigger.
+    if _in_quiet_hours(now) and now.minute >= 30:
+        return
+
     lines = [nag_summary_header(nag_count)]
     for e in pending:
         eid = e["id"]
