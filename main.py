@@ -16,7 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import belki_import
 import ledger
-from ledger import clean_name, infer_complexity, complexity_label
+from ledger import clean_name, infer_complexity, complexity_label, belki_priority_weight
 
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -25,8 +25,12 @@ TORONTO_TZ = pytz.timezone("America/Toronto")
 DISCORD_USER_ID = int(os.environ.get("DISCORD_USER_ID"))
 LOG_FILE = "tether.log"
 
+# gemini-2.5-pro dropped 2026-08-11: Google now returns 404 NOT_FOUND
+# ("no longer available to new users") for it. Since it always led this
+# list, every fallback loop hit that 404 on the very first attempt — see
+# the broadened except below for why that used to be fatal instead of
+# falling through to flash.
 MODELS = [
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
@@ -79,6 +83,7 @@ def build_meta(
     estimate="",
     belki_id="",
     project="",
+    priority="",
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = (
@@ -99,6 +104,11 @@ def build_meta(
     # can be attributed to that project's velocity.
     if project not in ("", None):
         meta += f"project={project}\n"
+    # Belki's own priority:: tag (P1-P4) — used by priority_score() in place
+    # of the keyword-guessed complexity so a user-tagged P4 can't out-rank a
+    # P2 just because its title happens to match a complexity keyword.
+    if priority not in ("", None):
+        meta += f"priority={priority}\n"
     return meta
 
 
@@ -166,6 +176,7 @@ def _insert_deadline(
     body_text: str | None = None,
     project: str | None = None,
     belki_id: str | None = None,
+    priority: str | None = None,
 ):
     """Internal insert used by both the Gemini tool and the Belki import."""
     # Hard override: Gemini sometimes passes midnight — force to 23:59
@@ -178,6 +189,7 @@ def _insert_deadline(
         estimate=estimate if estimate is not None else "",
         belki_id=belki_id or "",
         project=project or "",
+        priority=priority or "",
     )
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
@@ -232,6 +244,7 @@ def update_deadline_content(
     estimate: int | None,
     belki_id: str | None = None,
     project: str | None = None,
+    priority: str | None = None,
 ):
     """Updates title/description/due date of a belki-tracked event in place.
 
@@ -258,6 +271,8 @@ def update_deadline_content(
         meta["belki_id"] = belki_id
     if project:
         meta["project"] = project
+    if priority:
+        meta["priority"] = priority
 
     description = build_meta(**meta)
     description += f"\nOriginally due: {original_due}"
@@ -414,14 +429,21 @@ def priority_score(event: dict) -> float:
         days_until = max((due_date - today).days, 0)
     except ValueError:
         days_until = 999
-    name = (
-        event.get("summary", "")
-        .replace(DEADLINE_PREFIX, "")
-        .replace("— DUE", "")
-        .strip()
-    )
-    complexity = infer_complexity(name)
-    return days_until - (complexity * 2) - (pushes * 1.5)
+    # A Belki priority:: tag is the user's own call on urgency and takes
+    # precedence over the keyword-guessed complexity — otherwise a P4 task
+    # whose title happens to contain "build"/"project"/etc. ranks as urgent
+    # as a P2, which is exactly backwards. Ad-hoc (non-Belki) tasks carry no
+    # priority:: and keep using the keyword guess.
+    weight = belki_priority_weight(meta.get("priority"))
+    if weight is None:
+        name = (
+            event.get("summary", "")
+            .replace(DEADLINE_PREFIX, "")
+            .replace("— DUE", "")
+            .strip()
+        )
+        weight = infer_complexity(name)
+    return days_until - (weight * 2) - (pushes * 1.5)
 
 
 def rank_deadlines(deadlines: list) -> list:
@@ -438,12 +460,17 @@ def priority_reason(event: dict) -> str:
         days_until = (due_date - today).days
     except ValueError:
         days_until = 999
-    complexity = infer_complexity(
-        event.get("summary", "")
-        .replace(DEADLINE_PREFIX, "")
-        .replace("— DUE", "")
-        .strip()
-    )
+    weight = belki_priority_weight(meta.get("priority"))
+    if weight is not None:
+        label = f"priority {meta['priority'].strip().upper()}"
+    else:
+        complexity = infer_complexity(
+            event.get("summary", "")
+            .replace(DEADLINE_PREFIX, "")
+            .replace("— DUE", "")
+            .strip()
+        )
+        label = complexity_label(complexity)
     parts = []
     if days_until <= 2:
         parts.append("due very soon")
@@ -451,7 +478,7 @@ def priority_reason(event: dict) -> str:
         parts.append(f"due in {days_until} days")
     else:
         parts.append(f"due {due_str}")
-    parts.append(complexity_label(complexity))
+    parts.append(label)
     if pushes > 0:
         parts.append(f"pushed {pushes}×")
     return ", ".join(parts)
@@ -565,24 +592,21 @@ def parse_intent(user_message: str, model: str) -> dict:
 
 
 def parse_intent_with_fallback(user_message: str) -> tuple[dict, str]:
+    # Try every model before giving up — a hardcoded allowlist of "retryable"
+    # error substrings missed 404/NOT_FOUND when Google deprecated
+    # gemini-2.5-pro (2026-08-11), so the very first model's failure was
+    # treated as fatal instead of falling through to a working one. Matches
+    # the bare except already used for the deadline-picker call below.
+    last_error = None
     for model in MODELS:
         try:
             return parse_intent(user_message, model), model
         except Exception as e:
-            if any(
-                code in str(e)
-                for code in [
-                    "503",
-                    "UNAVAILABLE",
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "RemoteProtocolError",
-                    "incomplete chunked read",
-                ]
-            ):
-                continue
-            raise
-    raise Exception("All models are currently unavailable. Please try again later.")
+            last_error = e
+            continue
+    raise last_error or Exception(
+        "All models are currently unavailable. Please try again later."
+    )
 
 
 # --- SCHEDULER SESSION ---
@@ -639,6 +663,10 @@ def send_with_fallback(chat, user_id: int, message_content: str):
             current_index = 0
             user_model_index[user_id] = 0
             user_fallback_time.pop(user_id, None)
+    # See parse_intent_with_fallback: try every remaining model rather than
+    # gating on a fixed list of "retryable" error substrings, which missed
+    # 404/NOT_FOUND on gemini-2.5-pro's deprecation.
+    last_error = None
     for i in range(current_index, len(MODELS)):
         try:
             if i != current_index:
@@ -650,20 +678,11 @@ def send_with_fallback(chat, user_id: int, message_content: str):
             response = chat.send_message(message_content)
             return response, MODELS[i]
         except Exception as e:
-            if any(
-                code in str(e)
-                for code in [
-                    "503",
-                    "UNAVAILABLE",
-                    "429",
-                    "RESOURCE_EXHAUSTED",
-                    "RemoteProtocolError",
-                    "incomplete chunked read",
-                ]
-            ):
-                continue
-            raise
-    raise Exception("All models are currently unavailable. Please try again later.")
+            last_error = e
+            continue
+    raise last_error or Exception(
+        "All models are currently unavailable. Please try again later."
+    )
 
 
 def extract_reply(response, chat) -> str:

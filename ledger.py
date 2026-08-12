@@ -77,6 +77,25 @@ def complexity_label(score: int) -> str:
     )
 
 
+# P1 (most urgent) .. P4 (least urgent), on the same 1-4 scale priority_score
+# multiplies by 2 — same range infer_complexity() produces, so a Belki-tagged
+# priority and a keyword-guessed complexity are comparable magnitudes.
+BELKI_PRIORITY_WEIGHT = {"P1": 4, "P2": 3, "P3": 2, "P4": 1}
+
+
+def belki_priority_weight(priority: str | None) -> int | None:
+    """Weight for a Belki priority:: tag, or None if the task doesn't carry one.
+
+    A task the user explicitly tagged P4 must not out-rank one tagged P2 just
+    because its title happens to contain a complexity keyword ("build" is on
+    COMPLEXITY_HIGH regardless of whether the task is actually late-stage
+    infra). Callers use this in place of infer_complexity() whenever it
+    returns non-None; ad-hoc, non-Belki tasks carry no priority:: and keep
+    falling back to the keyword guess.
+    """
+    return BELKI_PRIORITY_WEIGHT.get((priority or "").strip().upper())
+
+
 def clean_name(summary: str) -> str:
     return (summary or "").replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
 

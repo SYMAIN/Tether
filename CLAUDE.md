@@ -57,16 +57,18 @@ Events created before `belki_id` tracking existed (pre-2026-07-07) carry no id a
 - **Scheduler session** — stateful multi-turn chat, has function-calling tools, uses `agent.md` as its system prompt.
 
 **State in Calendar event descriptions:**
-Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`, plus `estimate`, `belki_id` and `project` on Belki-imported events. Events predating a field carry none; the reconcile pass in `belki_import.sync()` stamps `belki_id`/`project` onto them in place (`needs_id` / `needs_project`) the first time their title still matches a live Belki task.
+Tasks store metadata in a `[TETHER_META]` block embedded in the Google Calendar event description. `parse_meta()` / `build_meta()` handle serialization. Fields: `pushes`, `created_at`, `last_modified`, `origin`, `nag_ignored`, `last_push_reason`, plus `estimate`, `belki_id`, `project` and `priority` on Belki-imported events. Events predating a field carry none; the reconcile pass in `belki_import.sync()` stamps `belki_id`/`project`/`priority` onto them in place (`needs_id` / `needs_project` / `priority_changed`) the first time their title still matches a live Belki task.
 
 **Nag loop** (`send_overdue_nag`, fires every 30 min):
 - Tracks `unacknowledged_overdue` (in-memory set of event IDs) across the session
 - `midnight_nag_persist()` writes `nag_ignored` counts back into calendar metadata at midnight and resets the counter
+- Nag pressure itself is priority-blind: every overdue event nags at the same 30-min cadence regardless of `priority_score` — that score only affects ranking (e.g. the morning briefing's "next up" pick), never whether/how loud something nags.
+- Nothing in the nag/sync path calls Gemini — `run_belki_sync()` is pure Python (file parsing + calendar CRUD). Only reactive `@Tether` messages and the scheduler chat touch the Gemini API, so nag frequency cannot exhaust its quota.
 
-**Priority engine** (`priority_score`, `rank_deadlines`):
-Scores tasks by `days_until - (complexity * 2) - (pushes * 1.5)`. Complexity is keyword-inferred from the task title using three keyword lists.
+**Priority engine** (`priority_score`, `rank_deadlines`, `priority_reason`):
+Scores tasks by `days_until - (weight * 2) - (pushes * 1.5)`. For Belki-imported tasks, `weight` comes from the task's own `priority::` tag (`ledger.belki_priority_weight`, P1=4 .. P4=1) — the user's explicit call on urgency, which takes precedence. Only ad-hoc (non-Belki) tasks, which carry no `priority::`, fall back to `weight = infer_complexity(title)` (keyword-guessed from three keyword lists in `ledger.py`). Before 2026-08-11, Belki's `priority::` was parsed on import and silently discarded — every task's urgency was keyword-guessed from its title regardless of its actual tag, so e.g. a P4 task whose title happened to contain "build"/"project"/"app"/etc. outranked a P2 task that didn't.
 
-**Model fallback chain:** `gemini-2.5-pro → gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.0-flash`
+**Model fallback chain:** `gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.0-flash`. `gemini-2.5-pro` was dropped 2026-08-11 after Google returned `404 NOT_FOUND` ("no longer available to new users") for it — since it led the list, every call hit that 404 on the very first attempt. `parse_intent_with_fallback`/`send_with_fallback` used to only retry on a fixed allowlist of error substrings (`503`/`429`/`RESOURCE_EXHAUSTED`/etc.), which didn't include `404`/`NOT_FOUND`, so the failure was fatal on the spot instead of falling through to a working model — this is what broke `@Tether` commands (including pushes) until fixed. Both now retry on any exception across the whole model list, matching the pattern already used by the push-date-picker Gemini call.
 
 ## Environment Variables
 

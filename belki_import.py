@@ -88,6 +88,7 @@ _FIELD_RE = re.compile(r"^\s+([A-Za-z_]+)::\s*(.*)$")
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
 _META_PROJECT_RE = re.compile(r"^project=(.+)$", re.M)
+_META_PRIORITY_RE = re.compile(r"^priority=(.+)$", re.M)
 _META_BODY_RE = re.compile(r"Originally due: \d{4}-\d{2}-\d{2}\n\n(.*)", re.DOTALL)
 
 
@@ -800,6 +801,9 @@ def sync(
             name_changed = cur_name.lower() != t["name"].lower()
             desc_changed = cur_body != (t["description"] or "")
             due_changed = fixed and want_due != cur_due
+            cur_priority_match = _META_PRIORITY_RE.search(cur_desc)
+            cur_priority = cur_priority_match.group(1).strip() if cur_priority_match else None
+            priority_changed = bool(t["priority"]) and t["priority"] != cur_priority
             # A legacy event registered by the backfill pass above carries no
             # belki_id yet. Stamp it even when nothing else differs — that is
             # the whole point of the backfill, and without this the id would
@@ -812,12 +816,13 @@ def sync(
             needs_project = not _META_PROJECT_RE.search(cur_desc)
             if not (
                 name_changed or desc_changed or due_changed or needs_id or needs_project
+                or priority_changed
             ):
                 continue
             new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
             update_deadline(
                 event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
-                belki_id=t["id"], project=t["project"],
+                belki_id=t["id"], project=t["project"], priority=t["priority"],
             )
             bits = []
             if name_changed:
@@ -830,6 +835,8 @@ def sync(
                 bits.append("belki_id backfilled onto legacy event")
             if needs_project:
                 bits.append(f"tagged to {t['project']}")
+            if priority_changed:
+                bits.append(f"priority set to {t['priority']}")
             icon = "🔧" if (needs_id or needs_project) else "🔄"
             reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
 
@@ -911,6 +918,7 @@ def sync(
             body_text=t["description"] or None,
             project=pname,
             belki_id=t["id"],
+            priority=t["priority"],
         )
         imported += 1
         est_note = (
