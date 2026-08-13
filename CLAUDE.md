@@ -105,6 +105,6 @@ LEDGER_DB=data/ledger.db        # optional, SQLite ledger path
 ## Key Invariants
 
 - Tether-managed events always have the `⏰` prefix (`DEADLINE_PREFIX`). Fixed user events must never be touched.
-- Pushes require a reason (`push_reason` must be non-null) — `validate_push_command` enforces this.
+- Pushes require a reason (`push_reason` must be non-null) — `validate_push_command` enforces this. The reason's *content* is never judged (deliberately — see `apply_push_runway_cap`'s docstring for why text-similarity/AI-graded excuse checks were rejected). Instead, repeated pushes on the same task buy less runway each time, content-blind: push 1 is unrestricted, push 2 caps at `today+3` days, push 3+ caps at `today+1` day (`PUSH_RUNWAY_CAP_DAYS`/`PUSH_RUNWAY_FLOOR_DAYS`, applied in `handle_push_with_reason` after `resolve_push_date`). Pushing is never blocked outright — only `complete`/`delete` are hard actions — consistent with "missed deadlines are never auto-moved."
 - Midnight `T00:00:00` times are hard-overridden to `T23:59:00` in `create_calendar_event` to prevent Gemini from assigning midnight deadlines.
 - `pending_clarifications` dict tracks users mid-clarification flow; their next message bypasses the intent parser and routes directly to the scheduler session.

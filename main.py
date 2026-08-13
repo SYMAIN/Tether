@@ -1196,6 +1196,44 @@ def resolve_push_date(
     return pick_push_date(name, push_reason, current_queue, original_message=content)
 
 
+# Repeated pushes on the same task buy less runway each time — content-blind
+# by design, so there's nothing in the stated reason to reword around (text-
+# similarity or AI-graded "is this excuse good enough" checks were both
+# rejected: a reworded excuse defeats the former, and grading excuse quality
+# is exactly the kind of subjective, arguable judgment call the priority
+# engine is deliberately kept free of — see Decisions.md, "Gemini decides
+# what the user meant, never what happens"). First push is unrestricted;
+# each push after that is capped at a shrinking ceiling that bottoms out at
+# PUSH_RUNWAY_FLOOR_DAYS rather than blocking pushes outright — missed
+# deadlines are still never auto-moved or forbidden, just increasingly
+# expensive to keep deferring.
+PUSH_RUNWAY_CAP_DAYS = {1: 3}  # prior pushes on this task -> max days out allowed
+PUSH_RUNWAY_FLOOR_DAYS = 1  # prior pushes >= 2 use this floor
+
+
+def apply_push_runway_cap(
+    date_str: str, prior_pushes: int, today: datetime.date
+) -> tuple[str, bool]:
+    """Clamps a resolved push date against the shrinking-runway ceiling.
+
+    prior_pushes is the count *before* this push (meta["pushes"] at
+    resolution time) -- 0 means this is the first push and is left
+    untouched. Only ever shrinks the date; never pushes it further out than
+    what was already resolved.
+    """
+    if prior_pushes < 1:
+        return date_str, False
+    cap_days = PUSH_RUNWAY_CAP_DAYS.get(prior_pushes, PUSH_RUNWAY_FLOOR_DAYS)
+    cap_date = today + datetime.timedelta(days=cap_days)
+    try:
+        resolved = datetime.date.fromisoformat(date_str)
+    except ValueError:
+        return date_str, False
+    if resolved > cap_date:
+        return cap_date.isoformat(), True
+    return date_str, False
+
+
 async def handle_push_with_reason(command: dict, content: str, message):
     task_title = command.get("task_title") or ""
     push_reason = command.get("push_reason", "")
@@ -1230,6 +1268,8 @@ async def handle_push_with_reason(command: dict, content: str, message):
     target_date, date_fallback = resolve_push_date(
         command, e, meta, name, push_reason, current_queue, content
     )
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    target_date, runway_capped = apply_push_runway_cap(target_date, meta["pushes"], today)
 
     new_start = f"{target_date}T23:59:00"
     e["start"] = {"dateTime": new_start, "timeZone": "America/Toronto"}
@@ -1246,14 +1286,20 @@ async def handle_push_with_reason(command: dict, content: str, message):
     unacknowledged_overdue.discard(event_id)
     task_nag_counts.pop(event_id, None)
 
-    fallback_note = " _(AI unavailable — defaulted to 7 days)_" if date_fallback else ""
+    fallback_note = f" _(AI unavailable — defaulted to {target_date})_" if date_fallback else ""
+    cap_note = (
+        f" _(runway capped — push #{meta['pushes']} on this task can't buy more than that)_"
+        if runway_capped
+        else ""
+    )
     await message.reply(
         f"📅 **{name}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
-        f"Push #{meta['pushes']}.{fallback_note}",
+        f"Push #{meta['pushes']}.{fallback_note}{cap_note}",
         mention_author=False,
     )
     log(
         f"[PUSH] {name} → {target_date} | reason: {push_reason} | pushes: {meta['pushes']}"
+        + (" | runway capped" if runway_capped else "")
     )
 
 
