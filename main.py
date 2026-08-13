@@ -47,6 +47,10 @@ TEST_MODE = os.environ.get("TEST_MODE", "false").lower() == "true"
 unacknowledged_overdue: set[str] = set()
 nag_count: int = 0
 task_nag_counts: dict[str, int] = {}
+# Event IDs "kept" today — send_overdue_nag skips them until midnight_nag_persist
+# clears this, so `keep` actually suppresses nagging instead of being silently
+# re-added on the very next cycle (see the 2026-08-11 decision on this).
+kept_today: set[str] = set()
 _started: bool = False
 
 
@@ -734,6 +738,13 @@ async def send_overdue_nag():
     current_ids = {e["id"] for e in current_overdue}
     unacknowledged_overdue = unacknowledged_overdue & current_ids
     for e in current_overdue:
+        # A "keep" today means the user has already acknowledged this task is
+        # staying — don't re-add it to the nag set until midnight_nag_persist
+        # clears kept_today. Without this, keep's discard() below is undone on
+        # the very next cycle and push/complete become the only things that
+        # ever actually stop the nagging.
+        if e["id"] in kept_today:
+            continue
         unacknowledged_overdue.add(e["id"])
     if not unacknowledged_overdue:
         return
@@ -761,11 +772,12 @@ async def send_overdue_nag():
 
 
 async def midnight_nag_persist():
-    global nag_count, unacknowledged_overdue, task_nag_counts
+    global nag_count, unacknowledged_overdue, task_nag_counts, kept_today
     trim_log()
     if not unacknowledged_overdue:
         nag_count = 0
         task_nag_counts.clear()
+        kept_today.clear()
         return
     current_overdue = get_overdue_tether_events()
     event_map = {e["id"]: e for e in current_overdue}
@@ -788,6 +800,7 @@ async def midnight_nag_persist():
         log(f"[MIDNIGHT] incremented nag_ignored on {event.get('summary')}")
     nag_count = 0
     task_nag_counts.clear()
+    kept_today.clear()
     await dm_user(
         f"🌙 Midnight check-in: {len(unacknowledged_overdue)} task(s) still unacknowledged. "
         f"They'll be waiting when you're back."
@@ -1202,12 +1215,18 @@ async def handle_keep(command: dict, message):
     event_id = e["id"]
     name = clean_name(e["summary"])
     unacknowledged_overdue.discard(event_id)
+    # Without this, send_overdue_nag's next cycle re-adds event_id straight
+    # back into unacknowledged_overdue and the discard above is meaningless —
+    # push/complete become the only things that ever stop the nagging.
+    # Cleared at midnight so an unresolved task still resumes pressure the
+    # next day rather than going silent forever.
+    kept_today.add(event_id)
     ledger.record_kept(e)
     await message.reply(
-        f"✅ Got it — **{name}** stays. I'll keep watching it.",
+        f"✅ Got it — **{name}** stays. I won't nag about it again today.",
         mention_author=False,
     )
-    log(f"[KEEP] {name} acknowledged")
+    log(f"[KEEP] {name} acknowledged, suppressed until midnight")
 
 
 @bot.event
@@ -1223,6 +1242,7 @@ async def on_ready():
     nag_count = 0
     unacknowledged_overdue = set()
     task_nag_counts.clear()
+    kept_today.clear()
 
     await asyncio.sleep(3)  # Give Discord state time to settle
 
