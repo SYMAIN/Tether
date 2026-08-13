@@ -3,6 +3,7 @@ import time
 import asyncio
 import json
 import datetime
+import random
 import discord
 import pytz
 import re
@@ -489,6 +490,47 @@ def priority_reason(event: dict) -> str:
 
 
 # --- NAG WORDING ENGINE ---
+# Each tier is a pool, not a single line — a task stuck at the top tier for
+# hours (the normal case once pushes/ignores climb past 6) used to repeat the
+# exact same sentence every 30 minutes. random.choice() keeps the pressure
+# but stops the wording from going numb. Tone stays confrontational, never
+# encouraging, per the "accountability over motivation" decision — vary the
+# words, not the attitude.
+_NAG_TIER_0 = [
+    "⚠️ **{name}** wasn't completed{orig_str}. Keep or push back? (`@Tether push {name} because <reason>` — I'll pick the date)",
+    "⚠️ **{name}** is now overdue{orig_str}. Tell me it's staying or tell me why it's moving. (`@Tether push {name} because <reason>`)",
+    "⚠️ **{name}** — the date passed. Keep or push back?",
+]
+
+_NAG_TIER_LOW = [
+    "⚠️ **{name}** is still sitting there{orig_str}.{reason_str} You haven't responded. Keep or push back?",
+    "⚠️ **{name}** — no response yet{orig_str}.{reason_str} Still your call: keep it or push it.",
+    "⚠️ **{name}** hasn't moved{orig_str}.{reason_str} Say something — keep or push back?",
+]
+
+_NAG_TIER_MID = [
+    "🔴 **{name}** — this has slipped {pushes} time(s) and you've ignored {ignored} reminder(s){orig_str}.{reason_str} What's actually blocking you? Keep or push back.",
+    "🔴 **{name}** — {ignored} reminder(s) in and still nothing{orig_str}.{reason_str} What's the actual holdup? Keep or push back.",
+    "🔴 **{name}** — {pushes} slip(s), {ignored} ignored{orig_str}.{reason_str} Something's blocking this. Name it or move it.",
+    "🔴 **{name}** — the silence is its own answer{orig_str}.{reason_str} What's blocking you? Keep or push back.",
+]
+
+_NAG_TIER_HIGH = [
+    "🔴 **{name}** — still here. Still overdue. You've deferred this {pushes} times{orig_str}.{reason_str} Either commit to a date or delete it. Don't ghost me.",
+    "🔴 **{name}** — {pushes} deferrals and counting{orig_str}.{reason_str} Commit to a real date or kill it. Don't just let it sit.",
+    "🔴 **{name}** — this is the same conversation as last time{orig_str}.{reason_str} Pick one: do it, push it with a reason, or delete it.",
+    "🔴 **{name}** — still unresolved{orig_str}.{reason_str} I'm not going to stop asking. Give me a date or give me a reason it's dead.",
+]
+
+_NAG_TIER_MAX = [
+    "🚨 **{name}** — {pushes} pushes. {ignored} ignored reminders{orig_str}.{reason_str} This task has been rotting. You either do it tonight or you tell me why. I'm not stopping.",
+    "🚨 **{name}** — {ignored} ignored reminders and {pushes} pushes{orig_str}.{reason_str} This isn't going away because you're not answering. Tonight, or tell me why.",
+    "🚨 **{name}** — {ignored} reminder(s) deep{orig_str}.{reason_str} You can't outlast me on this one specifically. Do it or push it with a real reason.",
+    "🚨 **{name}** — rotting at {ignored} ignored, {pushes} pushed{orig_str}.{reason_str} Silence isn't an answer I accept. Tonight or a reason.",
+    "🚨 **{name}** — this has been sitting for {ignored} reminder(s) straight{orig_str}.{reason_str} Either it happens tonight or you tell me what's actually stopping it.",
+]
+
+
 def nag_message(event: dict, session_nag_count: int) -> str:
     meta = parse_meta(event)
     pushes = meta["pushes"]
@@ -506,18 +548,33 @@ def nag_message(event: dict, session_nag_count: int) -> str:
     )
     last_reason = meta.get("last_push_reason", "")
     reason_str = f' Last reason: "{last_reason}".' if last_reason else ""
-    total_pressure = pushes + nag_ignored + session_nag_count
+    ignored = nag_ignored + session_nag_count
+    total_pressure = pushes + ignored
 
     if total_pressure == 0:
-        return f"⚠️ **{name}** wasn't completed{orig_str}. Keep or push back? (`@Tether push {name} because <reason>` — I'll pick the date)"
+        pool = _NAG_TIER_0
     elif total_pressure <= 2:
-        return f"⚠️ **{name}** is still sitting there{orig_str}.{reason_str} You haven't responded. Keep or push back?"
+        pool = _NAG_TIER_LOW
     elif total_pressure <= 4:
-        return f"🔴 **{name}** — this has slipped {pushes} time(s) and you've ignored {nag_ignored + session_nag_count} reminder(s){orig_str}.{reason_str} What's actually blocking you? Keep or push back."
+        pool = _NAG_TIER_MID
     elif total_pressure <= 6:
-        return f"🔴 **{name}** — still here. Still overdue. You've deferred this {pushes} times{orig_str}.{reason_str} Either commit to a date or delete it. Don't ghost me."
+        pool = _NAG_TIER_HIGH
     else:
-        return f"🚨 **{name}** — {pushes} pushes. {nag_ignored + session_nag_count} ignored reminders{orig_str}.{reason_str} This task has been rotting. You either do it tonight or you tell me why. I'm not stopping."
+        pool = _NAG_TIER_MAX
+
+    template = random.choice(pool)
+    return template.format(
+        name=name, orig_str=orig_str, reason_str=reason_str, pushes=pushes, ignored=ignored
+    )
+
+
+_NAG_HEADER_MAX = [
+    "📋 **Reminder #{n}. You can't outlast me.**\n",
+    "📋 **Reminder #{n}. Still here.**\n",
+    "📋 **Reminder #{n}. This isn't going away.**\n",
+    "📋 **#{n}. Same list, still unresolved.**\n",
+    "📋 **Reminder #{n}. Answer or resolve it.**\n",
+]
 
 
 def nag_summary_header(nag_count: int) -> str:
@@ -528,7 +585,7 @@ def nag_summary_header(nag_count: int) -> str:
     elif nag_count == 2:
         return "📋 **An hour in. These are still unacknowledged.**\n"
     else:
-        return f"📋 **Reminder #{nag_count + 1}. You can't outlast me.**\n"
+        return random.choice(_NAG_HEADER_MAX).format(n=nag_count + 1)
 
 
 # --- INTENT PARSER ---
