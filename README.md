@@ -7,6 +7,8 @@ Unlike traditional productivity systems, Tether does not manage focus sessions, 
 
 Tether owns the **when** — you own the **how**.
 
+**Status: v1.0 — feature-complete as of 2026-08-21.** Maintenance mode: bug fixes only, no new features planned. See [CHANGELOG.md](CHANGELOG.md).
+
 ---
 
 ## Philosophy
