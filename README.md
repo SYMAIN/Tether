@@ -35,16 +35,35 @@ The goal is minimal overhead with persistent accountability.
 
 ## Core Behavior
 
-Tether manages tasks as a Sunday-based deadline queue.
+Tether manages tasks as a Sunday-based deadline queue, per project.
 
 ### Standard Tasks
 
-New tasks are assigned to the next available Sunday slot.
+New ad-hoc tasks are assigned to the next available Sunday slot.
 
 Belki-imported subtasks are packed into weeks by estimated evenings
 (`EVENINGS_PER_WEEK`, default 4) — several small subtasks share one Sunday
 instead of each consuming a week. Subtasks without an estimate fill their
 whole week.
+
+### Multi-Project Scheduling
+
+Several Belki projects can run at once. `projects.md` (in the Belki vault)
+registers each project's `due::` and `status::`. Each week's evening capacity
+is split across active projects by **deadline pressure** — a project's
+required rate is its open evenings over the weeks left until its deadline,
+apportioned by largest remainder and capped at what it actually has left.
+Undeadlined projects split the remainder round-robin, longest-untouched-first.
+
+The split is computed once per week and pinned — spend is tracked at import
+time, not re-derived from the calendar, so finishing a task early doesn't
+hand its freed evening to the next task in the same week. A new week (or an
+explicit `sync belki <project>`, which hands the whole week to one project)
+recomputes the split.
+
+Forecasting compares each project's **measured** completion velocity against
+its required rate, not the sum of its open estimates, and flags projects
+falling behind as AT RISK (`weekly_queue_summary`, Sunday mornings).
 
 ### Urgent / ASAP Tasks
 
@@ -55,26 +74,38 @@ Urgent tasks insert at the front of the queue and push existing deadlines back o
 Completing a task removes it. Remaining deadlines stay where they are —
 finishing early is never punished by making the next deadline arrive sooner.
 
+Belki tasks are bidirectional: checking a task off (`- [x]`) in Belki
+auto-completes it in Tether and deletes its calendar event — no separate
+`@Tether completed` needed.
+
 ### Missed Tasks
 
 Missed deadlines remain in place until explicitly pushed or completed.
+Pushing always requires a reason, but is never blocked — only `complete`/
+`delete` are hard actions. Repeated pushes on the same task buy less runway
+each time (push 1 unrestricted, push 2 caps at +3 days, push 3+ caps at +1
+day), independent of what the reason says.
 
 ### Fixed Events
 
-Events created manually by the user are never modified.
+Events created manually by the user are never modified — only events with
+the `⏰` prefix are Tether-managed.
 
 ---
 
 ## Features
 
 - Natural language scheduling through Discord mentions
-- Queue-based deadline management
+- Queue-based deadline management, split across concurrent projects by deadline pressure
 - Automatic Sunday deadline assignment
 - ASAP insertion with cascading queue shifts
+- Bidirectional Belki sync — checking off a task in Belki completes it and clears its calendar event
+- Priority-aware ranking (`priority::` from Belki, keyword-inferred for ad-hoc tasks)
 - Google Calendar integration
 - Metadata tracking for postponed tasks
-- Proactive morning and evening reminders
-- Deadline escalation behavior
+- Proactive morning and evening reminders, plus weekly at-risk-project summaries
+- Overdue nag loop with quiet hours and per-task `keep` suppression
+- Content-blind push runway (repeated pushes buy progressively less runway)
 - Model fallback handling for Gemini API failures
 - Dockerized deployment with Windows auto-start support
 
@@ -101,9 +132,14 @@ Tether is intentionally lightweight:
 - Gemini handles natural language interpretation and scheduling decisions
 - Docker keeps the system continuously running
 
-No external database is required.
+Google Calendar remains the scheduling source of truth — task metadata is
+embedded directly into event descriptions, and nothing about *what's due
+when* lives anywhere else.
 
-Task metadata is embedded directly into Google Calendar event descriptions.
+A local SQLite ledger (`ledger.py`, default `data/ledger.db`) exists
+alongside it, but only for retrospective history — created/completed/pushed/
+kept/deleted/nag-ignored events — used for velocity forecasting and stats.
+It is never consulted to decide what's currently due.
 
 ---
 
@@ -111,14 +147,17 @@ Task metadata is embedded directly into Google Calendar event descriptions.
 
 ```txt
 Tether/
-├── main.py              # Core bot logic
-├── agent.md             # System prompt and scheduling rules
+├── main.py              # Core bot logic, nag loop, scheduled jobs
+├── belki_import.py      # Belki sync + project-deadline allocation
+├── ledger.py            # SQLite task-history ledger (stats only, not scheduling)
+├── agent.md             # System prompt and scheduling rules for the Gemini chat
 ├── requirements.txt
-├── Dockerfile
+├── dockerfile
 ├── docker-compose.yml
-├── .env
-├── credentials.json
-├── token.json
+├── .env                 # not in git
+├── credentials.json     # not in git
+├── token.json           # not in git
+├── data/                # ledger.db, not in git
 ├── start.bat
 └── stop.bat
 ```
@@ -145,9 +184,11 @@ DISCORD_BOT_TOKEN=your_token
 DISCORD_USER_ID=your_discord_id
 
 # optional
-EVENINGS_PER_WEEK=4      # weekly capacity bucket for Belki subtask packing
-BELKI_PATH=/app/belki    # Belki project files (mounted read-only in Docker)
-LEDGER_DB=data/ledger.db # SQLite task-history ledger
+MORNING_BRIEFING_ENABLED=true  # defaults true
+TEST_MODE=false                # fires all scheduled jobs 2 min after startup
+EVENINGS_PER_WEEK=4            # weekly capacity split across projects
+BELKI_PATH=/app/belki          # Belki vault mount (read-only)
+LEDGER_DB=data/ledger.db       # SQLite task-history ledger
 ```
 
 ---
@@ -185,6 +226,8 @@ Tether responds when mentioned:
 @Tether schedule circuits exam
 @Tether push lab report back one week
 @Tether completed deck renovation
+@Tether sync belki
+@Tether sync belki circuits
 ```
 
 ---
@@ -224,9 +267,26 @@ Tether can proactively DM:
 
 - Morning schedule briefings
 - Upcoming deadline warnings
-- Weekly queue summaries
+- Weekly queue summaries (per project, flagging AT RISK ones)
 - Overdue task follow-ups
 - Queue inactivity checks
+
+### Scheduled Jobs (America/Toronto)
+
+| Job                    | Schedule       |
+| ---------------------- | -------------- |
+| `send_overdue_nag`     | Every 30 min   |
+| `midnight_nag_persist` | 00:00 daily    |
+| `run_morning_jobs`     | 09:00 daily    |
+| `eod_sweep`            | 22:00 daily    |
+| `inactivity_check`     | 17:00 daily    |
+| `weekly_queue_summary` | Sunday 09:00   |
+
+`send_overdue_nag` reconciles Belki every 30 min regardless of quiet hours;
+between 23:00–08:00 the nag *DM* itself only sends on the top of the hour,
+so overdue pressure doesn't buzz the phone all night. A task marked `keep`
+goes quiet until midnight, then resumes normal pressure the next day if
+still unresolved.
 
 ---
 
@@ -248,21 +308,20 @@ This enables:
 - escalation behavior
 - continuity across sessions
 
-without requiring a database.
+directly on the calendar, with no round-trip to the ledger needed to know what's due.
 
 ---
 
 ## Model Fallback
 
-If Gemini fails or rate limits, Tether automatically retries using fallback models.
+If Gemini fails or rate limits, Tether automatically retries using fallback models — on *any* exception, not just a fixed allowlist (a bare 404 from a deprecated model used to be fatal instead of falling through).
 
 Current fallback chain:
 
 ```txt
-1. gemini-2.5-pro
-2. gemini-2.5-flash
-3. gemini-2.5-flash-lite
-4. gemini-2.0-flash
+1. gemini-2.5-flash
+2. gemini-2.5-flash-lite
+3. gemini-2.0-flash
 ```
 
 ---
