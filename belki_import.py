@@ -61,7 +61,7 @@ import ledger
 from ledger import clean_name
 
 BELKI_PATH = os.environ.get("BELKI_PATH", "/app/belki")
-EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "4"))
+EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "6"))
 
 # Health of a sync, so callers can tell a benign zero ("nothing new to
 # import") from a degraded one ("can't see Belki at all"). Both return
@@ -411,17 +411,10 @@ def allocate_evenings(
         lines.append(f"🔴 Past its project deadline: {', '.join(sorted(overdue))}.")
     for name in sorted(alloc, key=lambda k: (-alloc[k], k)):
         info = eligible[name]
-        if info["due"]:
-            wk = max((info["due"] - today).days, 0) / 7.0
-            lines.append(
-                f"• **{name}** — {alloc[name]} ev · due {info['due']} ({wk:.1f} wks) · "
-                f"{info['remaining']} ev open · needs {required[name]:.1f}/wk"
-            )
-        else:
-            lines.append(
-                f"• **{name}** — {alloc[name]} ev · no deadline · "
-                f"{info['remaining']} ev open"
-            )
+        due_note = f" · due {info['due']}" if info["due"] else ""
+        lines.append(
+            f"• **{name}** — {alloc[name]} ev this week, {info['remaining']} left{due_note}"
+        )
     return alloc, lines
 
 
@@ -451,25 +444,19 @@ def project_report(today: datetime.date = None) -> list:
         entry = _registry(projects, name)
         if entry and entry.get("status", "active") != "active":
             continue
-        observed = ledger.velocity(name)
         due = (entry or {}).get("due")
         if not due:
-            lines.append(
-                f"• **{name}** — {remaining[name]} ev open · no deadline · "
-                f"doing {observed}/wk"
-            )
+            lines.append(f"• **{name}** — {remaining[name]} ev open")
             continue
         days_left = (due - today).days
         need = remaining[name] / (max(days_left, 1) / 7.0)
+        observed = ledger.velocity(name)
         flag = ""
         if days_left <= 0:
             flag = "  🔴 PAST DEADLINE"
         elif observed < need:
             flag = "  ⚠️ AT RISK"
-        lines.append(
-            f"• **{name}** — due {due} ({max(days_left, 0) / 7.0:.1f} wks) · "
-            f"{remaining[name]} ev open · needs {need:.1f}/wk, doing {observed}/wk{flag}"
-        )
+        lines.append(f"• **{name}** — {remaining[name]} ev open · due {due}{flag}")
     return lines if len(lines) > 1 else []
 
 
