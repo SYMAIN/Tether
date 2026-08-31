@@ -604,18 +604,6 @@ def retro_lines(min_rows: int = 5) -> list[str]:
         lines.append(
             f"**On-time (30d):** {round(100 * on / tot)}% ({on}/{tot} done by their due date)"
         )
-    slip = avg_slip_days(days=30)
-    if slip is not None:
-        lines.append(f"**Avg slip per push (30d):** {slip} days")
-    top = most_pushed_open_task()
-    if top:
-        lines.append(f"**Most-pushed open task:** {top[0]} — {top[1]}×")
-    clusters = push_clusters(30)
-    if clusters:
-        lines.append(
-            "**Pushes by type (30d):** "
-            f"high {clusters.get(3, 0)} · medium {clusters.get(2, 0)} · quick {clusters.get(1, 0)}"
-        )
     for name, reason, count in recurring_reasons():
         lines.append(f'⚠️ **{name}** pushed {count}× citing "{reason}" — re-scope or drop.')
     return lines
