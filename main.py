@@ -411,13 +411,20 @@ def task_matches(query: str, event: dict) -> bool:
         .strip()
         .lower()
     )
+    # Also match against the project tag, so a task can be referenced by its
+    # project ("push job search ...") and not only by words that literally
+    # appear in the title. The project name isn't in the summary — it lives
+    # in the [TETHER_META] block — so a user who thinks of a task by which
+    # project it belongs to otherwise gets "no task matching" every time.
+    project = (parse_meta(event).get("project") or "").strip().lower()
+    haystack = f"{name} {project}".strip()
     q = query.lower().strip()
     if not q:
         # An empty query must never match — all() over zero words is
         # vacuously true and would match every event.
         return False
     return q == name or all(
-        re.search(r"\b" + re.escape(word) + r"\b", name) for word in q.split()
+        re.search(r"\b" + re.escape(word) + r"\b", haystack) for word in q.split()
     )
 
 
