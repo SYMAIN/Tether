@@ -85,6 +85,19 @@ _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
 # line can never be mistaken for a project entry.
 _PROJECT_LINE_RE = re.compile(r"^- (?!\[)(.+)$")
 _FIELD_RE = re.compile(r"^\s+([A-Za-z_]+)::\s*(.*)$")
+# Wider than _FIELD_RE (digits, hyphens) — used only to *notice* an indented
+# `key:: value` line the real parser would skip, e.g. a typo'd `deadline::`
+# or `due-date::` in place of `due::`. Detection only; nothing is parsed off it.
+_ANYKEY_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)::(?:\s|$)")
+# Keys the task-card parser understands (parsed) or deliberately leaves to
+# Belki (created/labels/completed are written by `/update`). Anything else
+# indented under an OPEN task is surfaced as a parser note rather than
+# silently dropped — an edit naming an unknown key looks applied but does
+# nothing (Simon lost time to `deadline:: 2026-09-12` on 2026-09-01).
+_KNOWN_TASK_KEYS = frozenset(
+    {"estimate", "est", "due", "project", "description", "id", "priority",
+     "created", "labels", "completed"}
+)
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
 _META_PROJECT_RE = re.compile(r"^project=(.+)$", re.M)
@@ -92,22 +105,37 @@ _META_PRIORITY_RE = re.compile(r"^priority=(.+)$", re.M)
 _META_BODY_RE = re.compile(r"Originally due: \d{4}-\d{2}-\d{2}\n\n(.*)", re.DOTALL)
 
 
-def parse_data_file(path: str) -> tuple[list[dict], list[str]]:
+def _unknown_key_note(task_name: str, key: str) -> str:
+    hint = (
+        " — did you mean `due::`?"
+        if key in ("deadline", "due-date", "duedate", "by", "deadline-date")
+        else ""
+    )
+    return f'"{task_name[:60]}": unrecognised field `{key}::` ignored{hint}'
+
+
+def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
     """Parses one monthly Belki data file.
 
-    Returns (tasks, skipped). Each task: {name, id, project, estimate, due,
-    description, done, priority}.
+    Returns (tasks, skipped, notes). `skipped` is lines the parser could not
+    read; `notes` is lines it read fine but chose to ignore (an unrecognised
+    `key::` under an open task) — kept separate so "couldn't parse" stays
+    honest. Each task: {name, id, project, estimate, due, description, done,
+    priority}.
     """
     with open(path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
 
     tasks: list[dict] = []
     skipped: list[str] = []
+    notes: list[str] = []
     current: dict | None = None
+    last_field_key: str | None = None  # for spotting description:: continuations
 
     for line in lines:
         match = _CHECKBOX_RE.match(line)
         if match:
+            last_field_key = None
             name = match.group(2).strip()
             if not name:
                 skipped.append(line.strip())
@@ -128,6 +156,13 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str]]:
         field = _FIELD_RE.match(line)
         if field and current:
             key, val = field.group(1).lower(), field.group(2).strip()
+            # A `word:: ...` line right after description:: is almost always a
+            # wrapped continuation of that prose, not a new field — don't flag
+            # an unknown key on it (known keys still parse), and keep the
+            # description context so a multi-line wrap stays covered.
+            in_desc_wrap = last_field_key == "description"
+            if key in _KNOWN_TASK_KEYS or not in_desc_wrap:
+                last_field_key = key
             if key in ("estimate", "est"):
                 try:
                     current["estimate"] = int(val)
@@ -147,44 +182,61 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str]]:
                 current["id"] = val
             elif key == "priority":
                 current["priority"] = val
-            # unknown keys (created::, labels::, completed::) are fine — ignore
+            elif key not in _KNOWN_TASK_KEYS and not current["done"] and not in_desc_wrap:
+                notes.append(_unknown_key_note(current["name"], key))
+            continue
+        anykey = _ANYKEY_RE.match(line)
+        if anykey and current and not current["done"] and last_field_key != "description":
+            # An indented `key:: value` _FIELD_RE wouldn't match (digit or
+            # hyphen in the key). Still a field the writer meant to set —
+            # unless we're inside a wrapped description, where it's just prose.
+            key = anykey.group(1).lower()
+            if key not in _KNOWN_TASK_KEYS:
+                notes.append(_unknown_key_note(current["name"], key))
             continue
         if line.startswith("- ") and line.strip():
             # top-level list line that isn't a checkbox
             skipped.append(line.strip())
             current = None
+            last_field_key = None
             continue
         if line.strip() and line[:1] not in (" ", "\t", "#"):
             current = None
+            last_field_key = None
 
-    return tasks, skipped
+    return tasks, skipped, notes
 
 
-def load_tasks(belki_path: str = None) -> tuple[list[dict], list[str]]:
+def load_tasks(belki_path: str = None) -> tuple[list[dict], list[str], list[str]]:
     """All tasks from BELKI_PATH/Data/*.md in file order. Duplicate ids keep
-    the first occurrence."""
+    the first occurrence. Returns (tasks, skipped, notes) — see
+    parse_data_file for the skipped/notes split."""
     data_dir = os.path.join(belki_path or BELKI_PATH, "Data")
     if not os.path.isdir(data_dir):
-        return [], [f"(no Data folder at {data_dir})"]
+        return [], [f"(no Data folder at {data_dir})"], []
     tasks: list[dict] = []
     skipped: list[str] = []
+    notes: list[str] = []
     seen_ids: set[str] = set()
     for fname in sorted(os.listdir(data_dir)):
         if not fname.lower().endswith(".md"):
             continue
         try:
-            file_tasks, file_skipped = parse_data_file(os.path.join(data_dir, fname))
+            file_tasks, file_skipped, file_notes = parse_data_file(
+                os.path.join(data_dir, fname)
+            )
         except Exception as e:
             skipped.append(f"({fname} unreadable: {e})")
             continue
         skipped.extend(file_skipped)
+        notes.extend(file_notes)
         for t in file_tasks:
             if t["id"] and t["id"] in seen_ids:
                 continue
             if t["id"]:
                 seen_ids.add(t["id"])
             tasks.append(t)
-    return tasks, skipped
+    return tasks, skipped, notes
 
 
 def open_project_counts(tasks: list[dict]) -> dict:
@@ -428,7 +480,7 @@ def project_report(today: datetime.date = None) -> list:
     """
     if not os.path.isdir(BELKI_PATH):
         return []
-    tasks, _ = load_tasks()
+    tasks, _, _ = load_tasks()
     projects, _note = load_projects()
     today = today or datetime.datetime.now(ledger.TORONTO_TZ).date()
 
@@ -623,7 +675,7 @@ def sync(
             STATUS_NO_BELKI_DIR,
         )
 
-    tasks, skipped = load_tasks()
+    tasks, skipped, notes = load_tasks()
     queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
     queue_names = set(queue_by_name)
     queue_by_id = {}
@@ -665,7 +717,11 @@ def sync(
         # Surface `skipped` here: when the folder is mounted but empty (or the
         # Data/ dir is missing entirely) that list holds the only clue why,
         # and discarding it made this state undiagnosable from Discord alone.
-        detail = f" Parser notes: {'; '.join(skipped[:5])}" if skipped else ""
+        detail = (
+            f" Parser notes: {'; '.join((skipped + notes)[:5])}"
+            if (skipped or notes)
+            else ""
+        )
         return finish(
             "⚠️ No open Belki tasks with a `project::` found in `Data/*.md`." + detail,
             0,
@@ -852,9 +908,15 @@ def sync(
             [vanished_line] if vanished_line else []
         )
         prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
+        suffix = (
+            "\n\nParser notes (read, but ignored):\n"
+            + "\n".join(f"  • {n}" for n in notes[:5])
+            if notes
+            else ""
+        )
         return finish(
             f"{prefix}Nothing new to schedule — this week's evenings are already "
-            f"committed.",
+            f"committed." + suffix,
             0,
             len(reconciled_lines),
         )
@@ -932,5 +994,8 @@ def sync(
     if skipped:
         lines.append("Skipped lines I couldn't parse:")
         lines.extend(f"  ✗ {s}" for s in skipped[:5])
+    if notes:
+        lines.append("Parser notes (read, but ignored):")
+        lines.extend(f"  • {n}" for n in notes[:5])
 
     return finish("\n".join(lines), imported, len(reconciled_lines))
