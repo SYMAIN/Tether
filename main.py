@@ -324,12 +324,49 @@ def list_upcoming_events(max_results: int = 20):
     return result.get("items", [])
 
 
+TETHER_DEADLINE_WINDOW_DAYS = 400
+
+
 def get_tether_deadlines():
-    """Returns only Tether-managed ⏰ deadline events."""
+    """Returns Tether-managed ⏰ deadline events from now out to
+    TETHER_DEADLINE_WINDOW_DAYS.
+
+    Paginated over the whole window rather than taking the first 50 upcoming
+    events: the calendar carries a daily recurring event, so `singleEvents`
+    expansion buries every Tether deadline more than ~6 weeks out past a
+    50-event cap. When that happened, the queue-derived dedup in
+    belki_import.sync() (both the name lookup and the belki_id lookup are
+    built from this list) never saw the event, so a Belki task with a far
+    `due::` — e.g. 2026-12-01 — re-imported on every 30-min nag cycle,
+    piling up duplicates (fixed 2026-09-02; task-oracin87 hit exactly this).
+
+    Residual gap: a Belki `due::` more than TETHER_DEADLINE_WINDOW_DAYS out
+    is still invisible here and would loop the same way. 400 days keeps the
+    per-sync cost to ~2 pages against the recurring-event volume.
+    """
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    horizon = (now_utc + datetime.timedelta(days=TETHER_DEADLINE_WINDOW_DAYS)).isoformat()
+    items = []
+    page_token = None
+    while True:
+        params = dict(
+            calendarId="primary",
+            timeMin=now_utc.isoformat(),
+            timeMax=horizon,
+            maxResults=250,
+            singleEvents=True,
+            orderBy="startTime",
+            timeZone="America/Toronto",
+        )
+        if page_token:
+            params["pageToken"] = page_token
+        result = get_service().events().list(**params).execute()
+        items.extend(result.get("items", []))
+        page_token = result.get("nextPageToken")
+        if not page_token:
+            break
     return [
-        e
-        for e in list_upcoming_events(50)
-        if e.get("summary", "").startswith(DEADLINE_PREFIX)
+        e for e in items if e.get("summary", "").startswith(DEADLINE_PREFIX)
     ]
 
 
