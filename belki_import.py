@@ -13,6 +13,7 @@ files at BELKI_PATH/Data/YYYY-MM.md:
       labels:: bug, infra
       estimate:: 2
       due:: 2026-07-12
+      depends_on:: task-yyyyyyyy-yyyyyy
       description:: one line
 
 Only tasks carrying a project:: are importable — unassigned tasks are
@@ -20,6 +21,15 @@ invisible to Tether. estimate:: is integer evenings and drives capacity
 packing (EVENINGS_PER_WEEK per week); a task without an estimate
 conservatively fills its whole week. A task with a future due:: keeps that
 exact date instead of being packed; a past due:: is repacked.
+
+depends_on:: names one other task's id:: as a prerequisite. A task with an
+open (not `- [x]`) dependency is invisible to both the weekly evening
+allocator and the importer — it never gets scheduled, and its evenings
+aren't counted as spendable this week — until the dependency is checked off.
+A depends_on:: naming itself or an id that doesn't exist anywhere in Belki is
+ignored (surfaced as a parser note), not treated as blocking forever. No
+transitive chains: only the one named task is checked, so A blocking on B
+blocking on C does not make A wait on C.
 
 Several projects run at once. Each week's EVENINGS_PER_WEEK evenings are
 split across them by deadline pressure, read from a registry at
@@ -96,7 +106,7 @@ _ANYKEY_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)::(?:\s|$)")
 # nothing (Simon lost time to `deadline:: 2026-09-12` on 2026-09-01).
 _KNOWN_TASK_KEYS = frozenset(
     {"estimate", "est", "due", "project", "description", "id", "priority",
-     "created", "labels", "completed"}
+     "created", "labels", "completed", "depends_on"}
 )
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
@@ -150,6 +160,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 "description": "",
                 "done": match.group(1).lower() == "x",
                 "priority": None,
+                "depends_on": None,
             }
             tasks.append(current)
             continue
@@ -182,6 +193,8 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 current["id"] = val
             elif key == "priority":
                 current["priority"] = val
+            elif key == "depends_on":
+                current["depends_on"] = val
             elif key not in _KNOWN_TASK_KEYS and not current["done"] and not in_desc_wrap:
                 notes.append(_unknown_key_note(current["name"], key))
             continue
@@ -237,6 +250,40 @@ def load_tasks(belki_path: str = None) -> tuple[list[dict], list[str], list[str]
                 seen_ids.add(t["id"])
             tasks.append(t)
     return tasks, skipped, notes
+
+
+def annotate_dependencies(tasks: list[dict]) -> list[str]:
+    """Resolves each task's depends_on:: against the full task list, in place.
+
+    Sets t["blocked_by"] to the prerequisite task's dict while it's still
+    open, or None once satisfied/absent. A depends_on:: naming itself or an
+    id absent from every Data/*.md file is cleared and reported as a note —
+    it can never be satisfied, so treating it as blocking would strand the
+    task forever over what's almost certainly a typo. Single-hop only: the
+    prerequisite's own depends_on:: is never followed, so a dependency cycle
+    (A on B, B on A) blocks both permanently rather than looping — an
+    accepted limitation, not detected or fixed here.
+    """
+    by_id = {t["id"]: t for t in tasks if t["id"]}
+    notes: list[str] = []
+    for t in tasks:
+        dep = t["depends_on"]
+        if not dep or t["done"]:
+            t["blocked_by"] = None
+            continue
+        if dep == t["id"]:
+            notes.append(f'"{t["name"][:60]}": depends_on:: references itself, ignored')
+            t["depends_on"] = None
+            t["blocked_by"] = None
+            continue
+        parent = by_id.get(dep)
+        if parent is None:
+            notes.append(f'"{t["name"][:60]}": depends_on:: {dep} not found, ignored')
+            t["depends_on"] = None
+            t["blocked_by"] = None
+            continue
+        t["blocked_by"] = parent if not parent["done"] else None
+    return notes
 
 
 def open_project_counts(tasks: list[dict]) -> dict:
@@ -368,7 +415,11 @@ def allocate_evenings(
         if entry and entry.get("status", "active") != "active":
             continue
         eligible[name] = {
-            "remaining": sum(_need(t) for t in ts),
+            # Blocked tasks (open depends_on::) don't count toward what a
+            # project can spend this week — otherwise a project whose next
+            # tasks are all waiting on a prerequisite still gets allocated
+            # evenings for them and can't spend any of it.
+            "remaining": sum(_need(t) for t in ts if not t.get("blocked_by")),
             "due": (entry or {}).get("due"),
         }
     if not eligible:
@@ -676,6 +727,7 @@ def sync(
         )
 
     tasks, skipped, notes = load_tasks()
+    notes = notes + annotate_dependencies(tasks)
     queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
     queue_names = set(queue_by_name)
     queue_by_id = {}
@@ -738,7 +790,21 @@ def sync(
             and t["name"].lower() not in queue_names
             and t["name"].lower() not in done_names
             and not (t["id"] and t["id"] in queue_by_id)
+            and not t.get("blocked_by")
         ]
+
+    # Reported once, up front, so a depends_on::-blocked task doesn't just
+    # silently vanish from the sync reply — it's still an open Belki task,
+    # it's just not this week's to schedule.
+    blocked_lines = [
+        f'⛔ [{t["project"]}] {t["name"]} — waiting on "{t["blocked_by"]["name"]}"'
+        for t in tasks
+        if t["project"]
+        and not t["done"]
+        and t["name"].lower() not in queue_names
+        and t["name"].lower() not in done_names
+        and t.get("blocked_by")
+    ]
 
     listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
     week = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
@@ -775,8 +841,9 @@ def sync(
         alloc_lines.append(registry_note)
 
     if not alloc:
+        detail = ("\n" + "\n".join(blocked_lines)) if blocked_lines else ""
         return finish(
-            f"No project has open Belki tasks to schedule. Available: {listing}.",
+            f"No project has open Belki tasks to schedule. Available: {listing}.{detail}",
             0,
             status=STATUS_NO_ACTIVE_PROJECT,
         )
@@ -926,7 +993,7 @@ def sync(
             new_tasks.append((t, pname))
 
     if not new_tasks:
-        pre_lines = alloc_lines + reconciled_lines + (
+        pre_lines = alloc_lines + reconciled_lines + blocked_lines + (
             [vanished_line] if vanished_line else []
         )
         prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
@@ -959,6 +1026,9 @@ def sync(
         lines.append("")
     if reconciled_lines:
         lines.extend(reconciled_lines)
+        lines.append("")
+    if blocked_lines:
+        lines.extend(blocked_lines)
         lines.append("")
     lines.append(f"📥 Scheduled {len(new_tasks)} task(s) for the week of {week_key}:")
 
