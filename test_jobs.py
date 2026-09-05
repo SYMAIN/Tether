@@ -36,7 +36,8 @@ def test_sync():
                 "start": {"dateTime": start}}
 
     text, imported, completed, reconciled, status = belki_import.sync(
-        main.get_tether_deadlines(), preview_insert, dry_run=True
+        main.get_tether_deadlines() + main.get_overdue_tether_events(),
+        preview_insert, dry_run=True,
     )
     print(
         f"[SYNC DRY RUN] would import {imported} task(s), complete {completed}, "

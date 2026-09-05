@@ -827,6 +827,7 @@ def sync(
     # Reconcile tasks already tracked by belki_id: a rename or a content/due
     # edit updates the existing event in place instead of leaving it orphaned
     # while a same-conceptual-task re-imports under its new name.
+    spent_dirty = False
     if update_deadline and not dry_run:
         for t in tasks:
             if not t["id"] or t["done"] or not t["project"]:
@@ -844,6 +845,20 @@ def sync(
             name_changed = cur_name.lower() != t["name"].lower()
             desc_changed = cur_body != (t["description"] or "")
             due_changed = fixed and want_due != cur_due
+            # A due:: added/moved out mid-week pulls the task out of the
+            # week it was pinned into — free the evenings it was holding
+            # so the rest of the week isn't short until Sunday's recompute
+            # (task-spentdrp-7k2n9q).
+            if due_changed and cur_due:
+                old_week = _next_sunday_on_or_after(datetime.date.fromisoformat(cur_due))
+                new_week = _next_sunday_on_or_after(datetime.date.fromisoformat(want_due))
+                if old_week == week and new_week != week:
+                    spent_key = next(
+                        (p for p in spent if p.lower() == t["project"].lower()), None
+                    )
+                    if spent_key:
+                        spent[spent_key] = max(0, spent[spent_key] - _need(t))
+                        spent_dirty = True
             cur_priority_match = _META_PRIORITY_RE.search(cur_desc)
             cur_priority = cur_priority_match.group(1).strip() if cur_priority_match else None
             priority_changed = bool(t["priority"]) and t["priority"] != cur_priority
@@ -882,6 +897,13 @@ def sync(
                 bits.append(f"priority set to {t['priority']}")
             icon = "🔧" if (needs_id or needs_project) else "🔄"
             reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
+
+    # Persist freed evenings now, not only in the end-of-sync write below —
+    # that write is skipped whenever nothing new gets imported this cycle
+    # (see the early `if not new_tasks: return` below), which would otherwise
+    # let a just-freed evening silently revert on the next sync's reload.
+    if spent_dirty:
+        ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
 
     # Pick this week's work: each project contributes tasks in Belki file
     # order (usually a dependency order) until its evening budget is used up.
