@@ -69,10 +69,16 @@ def parse_meta(event: dict) -> dict:
     match = re.search(r"\[TETHER_META\](.*?)(\[|$)", desc, re.DOTALL)
     if not match:
         return meta
+    # Only real meta keys (lowercase/underscore, `=` immediately after). The
+    # block has no closing tag, so the regex above can over-capture into an
+    # appended `Originally due:` line and the task description — and a
+    # description that's one long line with an `=` in it (a JS/TS snippet,
+    # say) used to land as a bogus key here, then blow up build_meta(**meta)
+    # on the next reconcile. Guarding the key shape drops that noise.
     for line in match.group(1).strip().splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            meta[k.strip()] = v.strip()
+        m = re.match(r"([a-z_]+)=(.*)$", line)
+        if m:
+            meta[m.group(1)] = m.group(2).strip()
     meta["pushes"] = int(meta.get("pushes", 0))
     meta["nag_ignored"] = int(meta.get("nag_ignored", 0))
     return meta
@@ -89,6 +95,9 @@ def build_meta(
     belki_id="",
     project="",
     priority="",
+    **_ignored,  # tolerate a stray key from a previously-corrupted meta block
+                 # rather than raising mid-reconcile (parse_meta now filters,
+                 # but events written before that fix may still carry one)
 ) -> str:
     today = datetime.datetime.now(TORONTO_TZ).strftime("%Y-%m-%d")
     meta = (
