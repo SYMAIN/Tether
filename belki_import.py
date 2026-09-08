@@ -83,11 +83,18 @@ STATUS_OK = "ok"
 STATUS_NO_BELKI_DIR = "no_belki_dir"
 STATUS_NO_TASKS = "no_tasks"
 STATUS_NO_ACTIVE_PROJECT = "no_active_project"
+# The completion pass deletes calendar events *before* the rest of sync() runs;
+# if imports/reconciles then raise, the "✅ cleared" lines used to die with the
+# stack frame (every caller just logs the exception) — event gone, nag stopped,
+# nothing said. sync() now catches that, returns what it managed, and marks the
+# result with this so the caller still speaks up (see the outer try in sync()).
+STATUS_SYNC_ERROR = "sync_error"
 
 DEGRADED_STATUSES = (
     STATUS_NO_BELKI_DIR,
     STATUS_NO_TASKS,
     STATUS_NO_ACTIVE_PROJECT,
+    STATUS_SYNC_ERROR,
 )
 
 _CHECKBOX_RE = re.compile(r"^- \[( |x|X)\] (.+)$")
@@ -743,6 +750,10 @@ def sync(
         return bool(t["due"]) and datetime.date.fromisoformat(t["due"]) > today
 
     completed_lines: list[str] = []
+    # Non-fatal problems (a single Calendar write that failed) — surfaced in the
+    # reply and enough on their own to make finish() report a degraded status,
+    # so a sync that only half-worked never looks like a clean no-op.
+    sync_errors: list[str] = []
     if complete_deadline and not dry_run:
         # Every project, not just one: the queue now spans several at once, and
         # scoping this to the single active project meant a task finished in
@@ -750,344 +761,392 @@ def sync(
         belki_done = {
             t["name"].lower() for t in tasks if t["project"] and t["done"]
         }
-        for name_lower in belki_done & queue_names:
+        # Sorted so a mid-loop failure is deterministic; per-item try so one
+        # bad delete doesn't strand the events already cleared this pass with
+        # no notification (the whole point of the fix — see STATUS_SYNC_ERROR).
+        for name_lower in sorted(belki_done & queue_names):
             event = queue_by_name[name_lower]
-            complete_deadline(event["id"])
+            title = clean_name(event.get("summary", ""))
+            try:
+                complete_deadline(event["id"])
+            except Exception as e:
+                sync_errors.append(
+                    f'"{title}" is done in Belki but its event would not clear '
+                    f"({type(e).__name__}) — check the calendar"
+                )
+                continue
             completed_lines.append(
-                f"✅ {clean_name(event.get('summary', ''))} — marked done in Belki, cleared."
+                f"✅ {title} — marked done in Belki, cleared."
             )
 
     def finish(
         text: str, imported: int, reconciled: int = 0, status: str = STATUS_OK
     ) -> tuple[str, int, int, int, str]:
+        parts = []
         if completed_lines:
-            text = "\n".join(completed_lines) + "\n\n" + text
-        return text, imported, len(completed_lines), reconciled, status
+            parts.append("\n".join(completed_lines))
+        if sync_errors:
+            parts.append(
+                "⚠️ Sync problems (the rest still went through; will retry next cycle):\n"
+                + "\n".join(f"  • {e}" for e in sync_errors)
+            )
+            if status == STATUS_OK:
+                status = STATUS_SYNC_ERROR
+        parts.append(text)
+        return "\n\n".join(parts), imported, len(completed_lines), reconciled, status
 
-    counts = open_project_counts(tasks)
-    if not counts:
-        # Surface `skipped` here: when the folder is mounted but empty (or the
-        # Data/ dir is missing entirely) that list holds the only clue why,
-        # and discarding it made this state undiagnosable from Discord alone.
-        detail = (
-            f" Parser notes: {'; '.join((skipped + notes)[:5])}"
-            if (skipped or notes)
-            else ""
-        )
-        return finish(
-            "⚠️ No open Belki tasks with a `project::` found in `Data/*.md`." + detail,
-            0,
-            status=STATUS_NO_TASKS,
-        )
+    try:
+        counts = open_project_counts(tasks)
+        if not counts:
+            # Surface `skipped` here: when the folder is mounted but empty (or the
+            # Data/ dir is missing entirely) that list holds the only clue why,
+            # and discarding it made this state undiagnosable from Discord alone.
+            detail = (
+                f" Parser notes: {'; '.join((skipped + notes)[:5])}"
+                if (skipped or notes)
+                else ""
+            )
+            return finish(
+                "⚠️ No open Belki tasks with a `project::` found in `Data/*.md`." + detail,
+                0,
+                status=STATUS_NO_TASKS,
+            )
 
-    def importable(pname: str) -> list[dict]:
-        return [
-            t
+        def importable(pname: str) -> list[dict]:
+            return [
+                t
+                for t in tasks
+                if t["project"]
+                and t["project"].lower() == pname.lower()
+                and not t["done"]
+                and t["name"].lower() not in queue_names
+                and t["name"].lower() not in done_names
+                and not (t["id"] and t["id"] in queue_by_id)
+                and not t.get("blocked_by")
+            ]
+
+        # Reported once, up front, so a depends_on::-blocked task doesn't just
+        # silently vanish from the sync reply — it's still an open Belki task,
+        # it's just not this week's to schedule.
+        blocked_lines = [
+            f'⛔ [{t["project"]}] {t["name"]} — waiting on "{t["blocked_by"]["name"]}"'
             for t in tasks
             if t["project"]
-            and t["project"].lower() == pname.lower()
             and not t["done"]
             and t["name"].lower() not in queue_names
             and t["name"].lower() not in done_names
-            and not (t["id"] and t["id"] in queue_by_id)
-            and not t.get("blocked_by")
+            and t.get("blocked_by")
         ]
 
-    # Reported once, up front, so a depends_on::-blocked task doesn't just
-    # silently vanish from the sync reply — it's still an open Belki task,
-    # it's just not this week's to schedule.
-    blocked_lines = [
-        f'⛔ [{t["project"]}] {t["name"]} — waiting on "{t["blocked_by"]["name"]}"'
-        for t in tasks
-        if t["project"]
-        and not t["done"]
-        and t["name"].lower() not in queue_names
-        and t["name"].lower() not in done_names
-        and t.get("blocked_by")
-    ]
+        listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
+        week = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
 
-    listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())
-    week = _next_sunday_on_or_after(today + datetime.timedelta(days=1))
-
-    if project_override:
-        needle = project_override.lower()
-        matches = [p for p in counts if needle in p.lower()]
-        if not matches:
-            return finish(f"No Belki project matching **{project_override}**. Available: {listing}.", 0)
-        # Explicit override: the whole week goes to that project, and it
-        # replaces whatever was pinned. Asking for a project by name is an
-        # instruction, not a hint.
-        alloc = {matches[0]: EVENINGS_PER_WEEK}
-        spent = {matches[0]: 0}
-        alloc_lines = [
-            f"🎯 Override — the week's {EVENINGS_PER_WEEK} evenings go to **{matches[0]}**."
-        ]
-        if not dry_run:
-            ledger.set_state(
-                _week_key(week), json.dumps({"alloc": alloc, "spent": spent})
-            )
-    else:
-        # Size of each project's next importable task, so the allocator never
-        # hands out a slice too small to schedule anything with.
-        min_units = {}
-        for pname in counts:
-            nxt = importable(pname)
-            if nxt:
-                min_units[pname] = _need(nxt[0])
-        alloc, spent, alloc_lines = _week_allocation(
-            projects, tasks, today, week, dry_run, deadlines, min_units=min_units
-        )
-    if registry_note and alloc_lines:
-        alloc_lines.append(registry_note)
-
-    if not alloc:
-        detail = ("\n" + "\n".join(blocked_lines)) if blocked_lines else ""
-        return finish(
-            f"No project has open Belki tasks to schedule. Available: {listing}.{detail}",
-            0,
-            status=STATUS_NO_ACTIVE_PROJECT,
-        )
-
-    # Any belki_id-tracked event whose task no longer exists anywhere in
-    # Belki (line deleted outright, not marked `- [x]`) is left alone — the
-    # signal is too ambiguous to auto-delete on — but surfaced for review.
-    all_ids = {t["id"] for t in tasks if t["id"]}
-    vanished = [
-        clean_name(e.get("summary", ""))
-        for bid, e in queue_by_id.items()
-        if bid not in all_ids
-    ]
-    vanished_line = (
-        f"⚠️ {len(vanished)} previously-imported task(s) no longer found in Belki "
-        "(deleted, not marked done) — not auto-removed, review: " + ", ".join(vanished)
-        if vanished
-        else None
-    )
-
-    # Backfill: events created before belki_id tracking existed (pre-2026-07-07)
-    # carry no belki_id, so the lookup above can never find them — any future
-    # rename permanently orphans them (old event stays stale, a duplicate
-    # imports under the new name) instead of updating in place. If a legacy
-    # event's title still matches a tracked task's current name, stamp the id
-    # (and estimate) onto it now, before it has a chance to drift. Already-
-    # orphaned events (title already changed) can't be recovered this way —
-    # their old title no longer matches anything and needs manual cleanup.
-    reconciled_lines: list[str] = []
-    if update_deadline and not dry_run:
-        for t in tasks:
-            # No project filter: the queue spans every project now, so what's
-            # in the queue defines the scope. Filtering to one project meant an
-            # event belonging to any other could never be repaired.
-            if not t["id"] or t["done"] or not t["project"] or t["id"] in queue_by_id:
-                continue
-            legacy_event = queue_by_name.get(clean_name(t["name"]).lower())
-            if not legacy_event or _META_ID_RE.search(legacy_event.get("description", "") or ""):
-                continue
-            # Register only — don't write here. The reconcile pass below is
-            # about to touch this same event and stamps belki_id itself, so
-            # writing now just means two Calendar writes and a doubled
-            # 🔧/🔄 pair in the reply for one logical change. Its `needs_id`
-            # check is what guarantees the stamp still happens when nothing
-            # else about the task differs.
-            queue_by_id[t["id"]] = legacy_event
-
-    # Reconcile tasks already tracked by belki_id: a rename or a content/due
-    # edit updates the existing event in place instead of leaving it orphaned
-    # while a same-conceptual-task re-imports under its new name.
-    spent_dirty = False
-    if update_deadline and not dry_run:
-        for t in tasks:
-            if not t["id"] or t["done"] or not t["project"]:
-                continue
-            event = queue_by_id.get(t["id"])
-            if not event:
-                continue
-            cur_name = clean_name(event.get("summary", ""))
-            cur_desc = event.get("description", "") or ""
-            body_match = _META_BODY_RE.search(cur_desc)
-            cur_body = body_match.group(1).strip() if body_match else ""
-            cur_due = (event.get("start", {}) or {}).get("dateTime", "")[:10]
-            fixed = is_fixed(t)
-            want_due = t["due"] if fixed else cur_due
-            name_changed = cur_name.lower() != t["name"].lower()
-            desc_changed = cur_body != (t["description"] or "")
-            due_changed = fixed and want_due != cur_due
-            # A due:: added/moved out mid-week pulls the task out of the
-            # week it was pinned into — free the evenings it was holding
-            # so the rest of the week isn't short until Sunday's recompute
-            # (task-spentdrp-7k2n9q).
-            if due_changed and cur_due:
-                old_week = _next_sunday_on_or_after(datetime.date.fromisoformat(cur_due))
-                new_week = _next_sunday_on_or_after(datetime.date.fromisoformat(want_due))
-                if old_week == week and new_week != week:
-                    spent_key = next(
-                        (p for p in spent if p.lower() == t["project"].lower()), None
-                    )
-                    if spent_key:
-                        spent[spent_key] = max(0, spent[spent_key] - _need(t))
-                        spent_dirty = True
-            cur_priority_match = _META_PRIORITY_RE.search(cur_desc)
-            cur_priority = cur_priority_match.group(1).strip() if cur_priority_match else None
-            priority_changed = bool(t["priority"]) and t["priority"] != cur_priority
-            # A legacy event registered by the backfill pass above carries no
-            # belki_id yet. Stamp it even when nothing else differs — that is
-            # the whole point of the backfill, and without this the id would
-            # only ever land on a task that happened to change in the same
-            # sync.
-            needs_id = not _META_ID_RE.search(cur_desc)
-            # Same idea for project=: events predating the multi-project queue
-            # don't say which project they belong to, so they can't be grouped
-            # or credited to a project's velocity until this stamps them.
-            needs_project = not _META_PROJECT_RE.search(cur_desc)
-            if not (
-                name_changed or desc_changed or due_changed or needs_id or needs_project
-                or priority_changed
-            ):
-                continue
-            new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
-            update_deadline(
-                event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
-                belki_id=t["id"], project=t["project"], priority=t["priority"],
-            )
-            bits = []
-            if name_changed:
-                bits.append(f'renamed from "{cur_name}"')
-            if desc_changed:
-                bits.append("description updated")
-            if due_changed:
-                bits.append(f"due moved to {want_due}")
-            if needs_id:
-                bits.append("belki_id backfilled onto legacy event")
-            if needs_project:
-                bits.append(f"tagged to {t['project']}")
-            if priority_changed:
-                bits.append(f"priority set to {t['priority']}")
-            icon = "🔧" if (needs_id or needs_project) else "🔄"
-            reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
-
-    # Persist freed evenings now, not only in the end-of-sync write below —
-    # that write is skipped whenever nothing new gets imported this cycle
-    # (see the early `if not new_tasks: return` below), which would otherwise
-    # let a just-freed evening silently revert on the next sync's reload.
-    if spent_dirty:
-        ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
-
-    # Pick this week's work: each project contributes tasks in Belki file
-    # order (usually a dependency order) until its evening budget is used up.
-    # A project already holding evenings in the target week has that counted
-    # against its budget, so a mid-week sync tops up rather than doubling.
-    week_key = week.isoformat()
-    new_tasks: list[tuple[dict, str]] = []
-    for pname in sorted(alloc, key=lambda p: (-alloc[p], p)):
-        used = spent.get(pname, 0)
-        for t in importable(pname):
-            if is_fixed(t):
-                # A hard date from Belki isn't the allocator's to move.
-                new_tasks.append((t, pname))
-                continue
-            need = _need(t)
-            if used + need > alloc[pname]:
-                break  # stop, don't skip — skipping would reorder the backlog
-            used += need
-            spent[pname] = used
-            new_tasks.append((t, pname))
-
-    if not new_tasks:
-        pre_lines = alloc_lines + reconciled_lines + blocked_lines + (
-            [vanished_line] if vanished_line else []
-        )
-        prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
-        suffix = (
-            "\n\nParser notes (read, but ignored):\n"
-            + "\n".join(f"  • {n}" for n in notes[:5])
-            if notes
-            else ""
-        )
-        return finish(
-            f"{prefix}Nothing new to schedule — this week's evenings are already "
-            f"committed." + suffix,
-            0,
-            len(reconciled_lines),
-        )
-
-    usage = week_usage(deadlines)
-    slot = week
-
-    for t, _ in new_tasks:
-        if is_fixed(t):
-            wk = _next_sunday_on_or_after(
-                datetime.date.fromisoformat(t["due"])
-            ).isoformat()
-            usage[wk] = usage.get(wk, 0) + _need(t)
-
-    lines = []
-    if alloc_lines:
-        lines.extend(alloc_lines)
-        lines.append("")
-    if reconciled_lines:
-        lines.extend(reconciled_lines)
-        lines.append("")
-    if blocked_lines:
-        lines.extend(blocked_lines)
-        lines.append("")
-    lines.append(f"📥 Scheduled {len(new_tasks)} task(s) for the week of {week_key}:")
-
-    imported = 0
-    for t, pname in new_tasks:
-        # Pack by estimated evenings: a week holds EVENINGS_PER_WEEK, not one
-        # task. The cursor only moves forward so Belki order (usually a
-        # dependency order) is preserved; a task with no estimate fills its
-        # whole week.
-        need = _need(t)
-        note = ""
-        if is_fixed(t):
-            due = t["due"]
-            note = " (fixed due date from Belki)"
+        if project_override:
+            needle = project_override.lower()
+            matches = [p for p in counts if needle in p.lower()]
+            if not matches:
+                return finish(f"No Belki project matching **{project_override}**. Available: {listing}.", 0)
+            # Explicit override: the whole week goes to that project, and it
+            # replaces whatever was pinned. Asking for a project by name is an
+            # instruction, not a hint.
+            alloc = {matches[0]: EVENINGS_PER_WEEK}
+            spent = {matches[0]: 0}
+            alloc_lines = [
+                f"🎯 Override — the week's {EVENINGS_PER_WEEK} evenings go to **{matches[0]}**."
+            ]
+            if not dry_run:
+                ledger.set_state(
+                    _week_key(week), json.dumps({"alloc": alloc, "spent": spent})
+                )
         else:
-            if t["due"]:
-                note = " (listed due date already passed — repacked)"
-            while not _fits(usage.get(slot.isoformat(), 0), need):
-                slot += datetime.timedelta(days=7)
-            due = slot.isoformat()
-            usage[due] = usage.get(due, 0) + need
-        insert_deadline(
-            f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE",
-            f"{due}T23:59:00",
-            f"{due}T23:59:00",
-            origin="belki_import",
-            estimate=t["estimate"],
-            body_text=t["description"] or None,
-            project=pname,
-            belki_id=t["id"],
-            priority=t["priority"],
-        )
-        imported += 1
-        est_note = (
-            f" (est: {t['estimate']} evening{'s' if t['estimate'] != 1 else ''})"
-            if t["estimate"] is not None
-            else " (no estimate — fills its week)"
-        )
-        lines.append(f"• [{pname}] {t['name']} — due {due}{est_note}{note}")
-        if t["estimate"] is not None and t["estimate"] > EVENINGS_PER_WEEK:
-            lines.append(
-                f"  ⚠️ estimated {t['estimate']} evenings exceeds your weekly capacity "
-                f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
+            # Size of each project's next importable task, so the allocator never
+            # hands out a slice too small to schedule anything with.
+            min_units = {}
+            for pname in counts:
+                nxt = importable(pname)
+                if nxt:
+                    min_units[pname] = _need(nxt[0])
+            alloc, spent, alloc_lines = _week_allocation(
+                projects, tasks, today, week, dry_run, deadlines, min_units=min_units
+            )
+        if registry_note and alloc_lines:
+            alloc_lines.append(registry_note)
+
+        if not alloc:
+            detail = ("\n" + "\n".join(blocked_lines)) if blocked_lines else ""
+            return finish(
+                f"No project has open Belki tasks to schedule. Available: {listing}.{detail}",
+                0,
+                status=STATUS_NO_ACTIVE_PROJECT,
             )
 
-    # Record the spend against the week. Without this the next sync would
-    # re-derive it from the calendar, where a completed task has vanished —
-    # and the evening it used would be handed straight to the next task.
-    if imported and not dry_run:
-        ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
+        # Any belki_id-tracked event whose task no longer exists anywhere in
+        # Belki (line deleted outright, not marked `- [x]`) is left alone — the
+        # signal is too ambiguous to auto-delete on — but surfaced for review.
+        all_ids = {t["id"] for t in tasks if t["id"]}
+        vanished = [
+            clean_name(e.get("summary", ""))
+            for bid, e in queue_by_id.items()
+            if bid not in all_ids
+        ]
+        vanished_line = (
+            f"⚠️ {len(vanished)} previously-imported task(s) no longer found in Belki "
+            "(deleted, not marked done) — not auto-removed, review: " + ", ".join(vanished)
+            if vanished
+            else None
+        )
 
-    if vanished_line:
-        lines.append(vanished_line)
+        # Backfill: events created before belki_id tracking existed (pre-2026-07-07)
+        # carry no belki_id, so the lookup above can never find them — any future
+        # rename permanently orphans them (old event stays stale, a duplicate
+        # imports under the new name) instead of updating in place. If a legacy
+        # event's title still matches a tracked task's current name, stamp the id
+        # (and estimate) onto it now, before it has a chance to drift. Already-
+        # orphaned events (title already changed) can't be recovered this way —
+        # their old title no longer matches anything and needs manual cleanup.
+        reconciled_lines: list[str] = []
+        if update_deadline and not dry_run:
+            for t in tasks:
+                # No project filter: the queue spans every project now, so what's
+                # in the queue defines the scope. Filtering to one project meant an
+                # event belonging to any other could never be repaired.
+                if not t["id"] or t["done"] or not t["project"] or t["id"] in queue_by_id:
+                    continue
+                legacy_event = queue_by_name.get(clean_name(t["name"]).lower())
+                if not legacy_event or _META_ID_RE.search(legacy_event.get("description", "") or ""):
+                    continue
+                # Register only — don't write here. The reconcile pass below is
+                # about to touch this same event and stamps belki_id itself, so
+                # writing now just means two Calendar writes and a doubled
+                # 🔧/🔄 pair in the reply for one logical change. Its `needs_id`
+                # check is what guarantees the stamp still happens when nothing
+                # else about the task differs.
+                queue_by_id[t["id"]] = legacy_event
 
-    if skipped:
-        lines.append("Skipped lines I couldn't parse:")
-        lines.extend(f"  ✗ {s}" for s in skipped[:5])
-    if notes:
-        lines.append("Parser notes (read, but ignored):")
-        lines.extend(f"  • {n}" for n in notes[:5])
+        # Reconcile tasks already tracked by belki_id: a rename or a content/due
+        # edit updates the existing event in place instead of leaving it orphaned
+        # while a same-conceptual-task re-imports under its new name.
+        spent_dirty = False
+        if update_deadline and not dry_run:
+            for t in tasks:
+                if not t["id"] or t["done"] or not t["project"]:
+                    continue
+                event = queue_by_id.get(t["id"])
+                if not event:
+                    continue
+                cur_name = clean_name(event.get("summary", ""))
+                cur_desc = event.get("description", "") or ""
+                body_match = _META_BODY_RE.search(cur_desc)
+                cur_body = body_match.group(1).strip() if body_match else ""
+                cur_due = (event.get("start", {}) or {}).get("dateTime", "")[:10]
+                fixed = is_fixed(t)
+                want_due = t["due"] if fixed else cur_due
+                name_changed = cur_name.lower() != t["name"].lower()
+                desc_changed = cur_body != (t["description"] or "")
+                due_changed = fixed and want_due != cur_due
+                # A due:: added/moved out mid-week pulls the task out of the
+                # week it was pinned into — free the evenings it was holding
+                # so the rest of the week isn't short until Sunday's recompute
+                # (task-spentdrp-7k2n9q).
+                if due_changed and cur_due:
+                    old_week = _next_sunday_on_or_after(datetime.date.fromisoformat(cur_due))
+                    new_week = _next_sunday_on_or_after(datetime.date.fromisoformat(want_due))
+                    if old_week == week and new_week != week:
+                        spent_key = next(
+                            (p for p in spent if p.lower() == t["project"].lower()), None
+                        )
+                        if spent_key:
+                            spent[spent_key] = max(0, spent[spent_key] - _need(t))
+                            spent_dirty = True
+                cur_priority_match = _META_PRIORITY_RE.search(cur_desc)
+                cur_priority = cur_priority_match.group(1).strip() if cur_priority_match else None
+                priority_changed = bool(t["priority"]) and t["priority"] != cur_priority
+                # A legacy event registered by the backfill pass above carries no
+                # belki_id yet. Stamp it even when nothing else differs — that is
+                # the whole point of the backfill, and without this the id would
+                # only ever land on a task that happened to change in the same
+                # sync.
+                needs_id = not _META_ID_RE.search(cur_desc)
+                # Same idea for project=: events predating the multi-project queue
+                # don't say which project they belong to, so they can't be grouped
+                # or credited to a project's velocity until this stamps them.
+                needs_project = not _META_PROJECT_RE.search(cur_desc)
+                if not (
+                    name_changed or desc_changed or due_changed or needs_id or needs_project
+                    or priority_changed
+                ):
+                    continue
+                new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
+                try:
+                    update_deadline(
+                        event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
+                        belki_id=t["id"], project=t["project"], priority=t["priority"],
+                    )
+                except Exception as e:
+                    sync_errors.append(
+                        f'could not reconcile "{t["name"]}" ({type(e).__name__})'
+                    )
+                    continue
+                bits = []
+                if name_changed:
+                    bits.append(f'renamed from "{cur_name}"')
+                if desc_changed:
+                    bits.append("description updated")
+                if due_changed:
+                    bits.append(f"due moved to {want_due}")
+                if needs_id:
+                    bits.append("belki_id backfilled onto legacy event")
+                if needs_project:
+                    bits.append(f"tagged to {t['project']}")
+                if priority_changed:
+                    bits.append(f"priority set to {t['priority']}")
+                icon = "🔧" if (needs_id or needs_project) else "🔄"
+                reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
 
-    return finish("\n".join(lines), imported, len(reconciled_lines))
+        # Persist freed evenings now, not only in the end-of-sync write below —
+        # that write is skipped whenever nothing new gets imported this cycle
+        # (see the early `if not new_tasks: return` below), which would otherwise
+        # let a just-freed evening silently revert on the next sync's reload.
+        if spent_dirty:
+            ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
+
+        # Pick this week's work: each project contributes tasks in Belki file
+        # order (usually a dependency order) until its evening budget is used up.
+        # A project already holding evenings in the target week has that counted
+        # against its budget, so a mid-week sync tops up rather than doubling.
+        week_key = week.isoformat()
+        new_tasks: list[tuple[dict, str]] = []
+        for pname in sorted(alloc, key=lambda p: (-alloc[p], p)):
+            used = spent.get(pname, 0)
+            for t in importable(pname):
+                if is_fixed(t):
+                    # A hard date from Belki isn't the allocator's to move.
+                    new_tasks.append((t, pname))
+                    continue
+                need = _need(t)
+                if used + need > alloc[pname]:
+                    break  # stop, don't skip — skipping would reorder the backlog
+                used += need
+                spent[pname] = used
+                new_tasks.append((t, pname))
+
+        if not new_tasks:
+            pre_lines = alloc_lines + reconciled_lines + blocked_lines + (
+                [vanished_line] if vanished_line else []
+            )
+            prefix = "\n".join(pre_lines) + "\n\n" if pre_lines else ""
+            suffix = (
+                "\n\nParser notes (read, but ignored):\n"
+                + "\n".join(f"  • {n}" for n in notes[:5])
+                if notes
+                else ""
+            )
+            return finish(
+                f"{prefix}Nothing new to schedule — this week's evenings are already "
+                f"committed." + suffix,
+                0,
+                len(reconciled_lines),
+            )
+
+        usage = week_usage(deadlines)
+        slot = week
+
+        for t, _ in new_tasks:
+            if is_fixed(t):
+                wk = _next_sunday_on_or_after(
+                    datetime.date.fromisoformat(t["due"])
+                ).isoformat()
+                usage[wk] = usage.get(wk, 0) + _need(t)
+
+        lines = []
+        if alloc_lines:
+            lines.extend(alloc_lines)
+            lines.append("")
+        if reconciled_lines:
+            lines.extend(reconciled_lines)
+            lines.append("")
+        if blocked_lines:
+            lines.extend(blocked_lines)
+            lines.append("")
+        lines.append(f"📥 Scheduled {len(new_tasks)} task(s) for the week of {week_key}:")
+
+        imported = 0
+        for t, pname in new_tasks:
+            # Pack by estimated evenings: a week holds EVENINGS_PER_WEEK, not one
+            # task. The cursor only moves forward so Belki order (usually a
+            # dependency order) is preserved; a task with no estimate fills its
+            # whole week.
+            need = _need(t)
+            note = ""
+            if is_fixed(t):
+                due = t["due"]
+                note = " (fixed due date from Belki)"
+            else:
+                if t["due"]:
+                    note = " (listed due date already passed — repacked)"
+                while not _fits(usage.get(slot.isoformat(), 0), need):
+                    slot += datetime.timedelta(days=7)
+                due = slot.isoformat()
+                usage[due] = usage.get(due, 0) + need
+            try:
+                insert_deadline(
+                    f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE",
+                    f"{due}T23:59:00",
+                    f"{due}T23:59:00",
+                    origin="belki_import",
+                    estimate=t["estimate"],
+                    body_text=t["description"] or None,
+                    project=pname,
+                    belki_id=t["id"],
+                    priority=t["priority"],
+                )
+            except Exception as e:
+                sync_errors.append(
+                    f'could not import "{t["name"]}" ({type(e).__name__})'
+                )
+                continue
+            imported += 1
+            est_note = (
+                f" (est: {t['estimate']} evening{'s' if t['estimate'] != 1 else ''})"
+                if t["estimate"] is not None
+                else " (no estimate — fills its week)"
+            )
+            lines.append(f"• [{pname}] {t['name']} — due {due}{est_note}{note}")
+            if t["estimate"] is not None and t["estimate"] > EVENINGS_PER_WEEK:
+                lines.append(
+                    f"  ⚠️ estimated {t['estimate']} evenings exceeds your weekly capacity "
+                    f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
+                )
+
+        # Record the spend against the week. Without this the next sync would
+        # re-derive it from the calendar, where a completed task has vanished —
+        # and the evening it used would be handed straight to the next task.
+        if imported and not dry_run:
+            ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
+
+        if vanished_line:
+            lines.append(vanished_line)
+
+        if skipped:
+            lines.append("Skipped lines I couldn't parse:")
+            lines.extend(f"  ✗ {s}" for s in skipped[:5])
+        if notes:
+            lines.append("Parser notes (read, but ignored):")
+            lines.extend(f"  • {n}" for n in notes[:5])
+
+        return finish("\n".join(lines), imported, len(reconciled_lines))
+    except Exception as e:
+        # The completion pass above already deleted events and filled
+        # completed_lines; without this, an error here (a Calendar 5xx on a
+        # reconcile/import write, a stale socket, an allocation edge case)
+        # propagated out and every caller just log()'d it — so the user saw
+        # the nag stop with no word that anything had completed. Return what
+        # we have; STATUS_SYNC_ERROR makes the caller speak up regardless.
+        return finish(
+            f"Completions applied, but the rest of the sync (imports, "
+            f"reconciles) errored partway: {type(e).__name__}: {e}. "
+            f"Retrying next cycle.",
+            0,
+            0,
+            status=STATUS_SYNC_ERROR,
+        )
