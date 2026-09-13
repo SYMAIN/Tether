@@ -30,7 +30,11 @@ aren't counted as spendable this week — until the dependency is checked off.
 A depends_on:: naming itself or an id that doesn't exist anywhere in Belki is
 ignored (surfaced as a parser note), not treated as blocking forever. No
 transitive chains: only the one named task is checked, so A blocking on B
-blocking on C does not make A wait on C.
+blocking on C does not make A wait on C. If depends_on:: is added to a task
+*after* it was already imported (already has a ⏰ event), sync() clears that
+event too — the same delete_deadline path status:: parked uses — since
+otherwise the new dependency would silently do nothing until the event
+cleared some other way.
 
 status:: parked marks a task Simon has deliberately abandoned but not done —
 the "dismiss without lying that it's complete" case `complete` can't cover
@@ -720,8 +724,9 @@ def sync(
 ) -> tuple[str, int, int, int, str]:
     """Schedules the coming week's work across projects by deadline pressure.
     Also completes any queued ⏰ event whose Belki task is now marked done,
-    clears any queued ⏰ event whose Belki task is now marked status:: parked,
-    and reconciles renames/edits on tasks already tracked by belki_id.
+    clears any queued ⏰ event whose Belki task is now marked status:: parked
+    or newly blocked by an open depends_on::, and reconciles renames/edits on
+    tasks already tracked by belki_id.
 
     deadlines: current ⏰ queue events — should include overdue events too
     (main.get_tether_deadlines() + main.get_overdue_tether_events()) so a
@@ -735,9 +740,10 @@ def sync(
     in Belki updates its existing event in place instead of leaving an
     orphaned event and importing a duplicate under the new name.
     delete_deadline: main.delete_calendar_event, or None to skip auto-clearing
-    of parked tasks (e.g. dry runs never pass one). Unlike complete_deadline,
-    this records `deleted` in the ledger (via delete_calendar_event itself),
-    not `completed` — parking a task must never count toward velocity().
+    of parked or newly-blocked tasks (e.g. dry runs never pass one). Unlike
+    complete_deadline, this records `deleted` in the ledger (via
+    delete_calendar_event itself), not `completed` — neither parking nor
+    blocking a task may ever count toward velocity().
     project_override: an explicit `sync belki <name>` — hands the whole week
     to that project and replaces whatever was pinned.
     dry_run: don't pin the allocation or complete anything (caller passes a
@@ -828,6 +834,40 @@ def sync(
                 continue
             completed_lines.append(
                 f"⏸️ {title} — parked in Belki, cleared from calendar."
+            )
+
+        # Same problem, different cause: a task that gets a depends_on::
+        # added *after* it was already imported is just as stuck-on-the-
+        # calendar as a parked one — importable()/allocate_evenings() only
+        # ever stop a *new* import, they never reach back and un-schedule
+        # an event that already exists. Without this, adding depends_on::
+        # to an in-flight task silently does nothing until that event
+        # happens to clear some other way. Excludes parked tasks — already
+        # handled above, and deleting the same event twice would just log a
+        # spurious error on the second attempt.
+        blocked_map = {
+            t["name"].lower(): t
+            for t in tasks
+            if t["project"]
+            and not t["done"]
+            and t.get("blocked_by")
+            and t.get("status") != "parked"
+        }
+        for name_lower in sorted(set(blocked_map) & queue_names):
+            t = blocked_map[name_lower]
+            event = queue_by_name[name_lower]
+            title = clean_name(event.get("summary", ""))
+            try:
+                delete_deadline(event["id"])
+            except Exception as e:
+                sync_errors.append(
+                    f'"{title}" is now blocked in Belki but its event would not '
+                    f"clear ({type(e).__name__}) — check the calendar"
+                )
+                continue
+            completed_lines.append(
+                f'⛔ {title} — now waiting on "{t["blocked_by"]["name"]}", '
+                f"cleared from calendar."
             )
 
     def finish(
