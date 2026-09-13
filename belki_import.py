@@ -14,6 +14,7 @@ files at BELKI_PATH/Data/YYYY-MM.md:
       estimate:: 2
       due:: 2026-07-12
       depends_on:: task-yyyyyyyy-yyyyyy
+      status:: parked
       description:: one line
 
 Only tasks carrying a project:: are importable — unassigned tasks are
@@ -30,6 +31,17 @@ A depends_on:: naming itself or an id that doesn't exist anywhere in Belki is
 ignored (surfaced as a parser note), not treated as blocking forever. No
 transitive chains: only the one named task is checked, so A blocking on B
 blocking on C does not make A wait on C.
+
+status:: parked marks a task Simon has deliberately abandoned but not done —
+the "dismiss without lying that it's complete" case `complete` can't cover
+without corrupting ledger.velocity(). Like a blocked task, a parked one is
+excluded from evening allocation and import; unlike a blocked one, if it
+already has a tracked ⏰ event that event is deleted outright (recorded as
+`deleted` in the ledger, same path as delete_calendar_event, so it never
+counts toward velocity()). Removing status:: parked (or checking the task
+`- [x]`) picks it back up on the next sync like any other task. This is
+unrelated to projects.md's own status:: field (project-level active/paused)
+— same field name, different card type, different scope.
 
 Several projects run at once. Each week's EVENINGS_PER_WEEK evenings are
 split across them by deadline pressure, read from a registry at
@@ -113,7 +125,7 @@ _ANYKEY_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)::(?:\s|$)")
 # nothing (Simon lost time to `deadline:: 2026-09-12` on 2026-09-01).
 _KNOWN_TASK_KEYS = frozenset(
     {"estimate", "est", "due", "project", "description", "id", "priority",
-     "created", "labels", "completed", "depends_on"}
+     "created", "labels", "completed", "depends_on", "status"}
 )
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
@@ -168,6 +180,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 "done": match.group(1).lower() == "x",
                 "priority": None,
                 "depends_on": None,
+                "status": None,
             }
             tasks.append(current)
             continue
@@ -202,6 +215,8 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 current["priority"] = val
             elif key == "depends_on":
                 current["depends_on"] = val
+            elif key == "status":
+                current["status"] = val.lower()
             elif key not in _KNOWN_TASK_KEYS and not current["done"] and not in_desc_wrap:
                 notes.append(_unknown_key_note(current["name"], key))
             continue
@@ -422,11 +437,15 @@ def allocate_evenings(
         if entry and entry.get("status", "active") != "active":
             continue
         eligible[name] = {
-            # Blocked tasks (open depends_on::) don't count toward what a
-            # project can spend this week — otherwise a project whose next
-            # tasks are all waiting on a prerequisite still gets allocated
-            # evenings for them and can't spend any of it.
-            "remaining": sum(_need(t) for t in ts if not t.get("blocked_by")),
+            # Blocked (open depends_on::) and parked (status:: parked) tasks
+            # don't count toward what a project can spend this week —
+            # otherwise a project whose next tasks are all waiting or
+            # abandoned still gets allocated evenings for them and can't
+            # spend any of it.
+            "remaining": sum(
+                _need(t) for t in ts
+                if not t.get("blocked_by") and t.get("status") != "parked"
+            ),
             "due": (entry or {}).get("due"),
         }
     if not eligible:
@@ -695,11 +714,13 @@ def sync(
     insert_deadline,
     complete_deadline=None,
     update_deadline=None,
+    delete_deadline=None,
     project_override: str = None,
     dry_run: bool = False,
 ) -> tuple[str, int, int, int, str]:
     """Schedules the coming week's work across projects by deadline pressure.
     Also completes any queued ⏰ event whose Belki task is now marked done,
+    clears any queued ⏰ event whose Belki task is now marked status:: parked,
     and reconciles renames/edits on tasks already tracked by belki_id.
 
     deadlines: current ⏰ queue events — should include overdue events too
@@ -713,16 +734,20 @@ def sync(
     stamped into TETHER_META at import time — a task renamed or re-described
     in Belki updates its existing event in place instead of leaving an
     orphaned event and importing a duplicate under the new name.
+    delete_deadline: main.delete_calendar_event, or None to skip auto-clearing
+    of parked tasks (e.g. dry runs never pass one). Unlike complete_deadline,
+    this records `deleted` in the ledger (via delete_calendar_event itself),
+    not `completed` — parking a task must never count toward velocity().
     project_override: an explicit `sync belki <name>` — hands the whole week
     to that project and replaces whatever was pinned.
     dry_run: don't pin the allocation or complete anything (caller passes a
     non-inserting insert_deadline too).
-    Returns (reply text, number imported, number auto-completed, number
-    reconciled, status). Callers that only fire a notification on activity
-    must check all three counts — a sync that only clears finished Belki
-    tasks, or only reconciles a rename, has imported == 0 — and must check
-    status too, or a sync that is failing outright looks identical to a
-    quiet one (see the STATUS_* constants).
+    Returns (reply text, number imported, number auto-completed or parked-
+    cleared, number reconciled, status). Callers that only fire a
+    notification on activity must check all three counts — a sync that only
+    clears finished or parked Belki tasks, or only reconciles a rename, has
+    imported == 0 — and must check status too, or a sync that is failing
+    outright looks identical to a quiet one (see the STATUS_* constants).
     """
     if not os.path.isdir(BELKI_PATH):
         return (
@@ -779,6 +804,32 @@ def sync(
                 f"✅ {title} — marked done in Belki, cleared."
             )
 
+    if delete_deadline and not dry_run:
+        # A task parked mid-flight (already imported, now marked
+        # status:: parked without being checked off) needs its event gone
+        # too, or the nag it was set to silence just keeps firing off the
+        # stale ⏰ event. `not t["done"]` keeps this disjoint from the
+        # completion loop above — a task can't be both.
+        belki_parked = {
+            t["name"].lower()
+            for t in tasks
+            if t["project"] and not t["done"] and t.get("status") == "parked"
+        }
+        for name_lower in sorted(belki_parked & queue_names):
+            event = queue_by_name[name_lower]
+            title = clean_name(event.get("summary", ""))
+            try:
+                delete_deadline(event["id"])
+            except Exception as e:
+                sync_errors.append(
+                    f'"{title}" is parked in Belki but its event would not clear '
+                    f"({type(e).__name__}) — check the calendar"
+                )
+                continue
+            completed_lines.append(
+                f"⏸️ {title} — parked in Belki, cleared from calendar."
+            )
+
     def finish(
         text: str, imported: int, reconciled: int = 0, status: str = STATUS_OK
     ) -> tuple[str, int, int, int, str]:
@@ -823,11 +874,12 @@ def sync(
                 and t["name"].lower() not in done_names
                 and not (t["id"] and t["id"] in queue_by_id)
                 and not t.get("blocked_by")
+                and t.get("status") != "parked"
             ]
 
-        # Reported once, up front, so a depends_on::-blocked task doesn't just
-        # silently vanish from the sync reply — it's still an open Belki task,
-        # it's just not this week's to schedule.
+        # Reported once, up front, so a depends_on::-blocked or parked task
+        # doesn't just silently vanish from the sync reply — it's still an
+        # open Belki task, it's just not this week's to schedule.
         blocked_lines = [
             f'⛔ [{t["project"]}] {t["name"]} — waiting on "{t["blocked_by"]["name"]}"'
             for t in tasks
@@ -836,6 +888,14 @@ def sync(
             and t["name"].lower() not in queue_names
             and t["name"].lower() not in done_names
             and t.get("blocked_by")
+        ] + [
+            f'🅿️ [{t["project"]}] {t["name"]} — parked'
+            for t in tasks
+            if t["project"]
+            and not t["done"]
+            and t["name"].lower() not in queue_names
+            and t["name"].lower() not in done_names
+            and t.get("status") == "parked"
         ]
 
         listing = ", ".join(f"**{p}** ({n} open)" for p, n in counts.items())

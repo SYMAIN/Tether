@@ -1088,6 +1088,7 @@ def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int, st
         _insert_deadline,
         complete_deadline=complete_task,
         update_deadline=update_deadline_content,
+        delete_deadline=delete_calendar_event,
         project_override=project_override,
     )
 
