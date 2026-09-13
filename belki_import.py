@@ -1093,7 +1093,21 @@ def sync(
                 if desc_changed:
                     bits.append("description updated")
                 if due_changed:
-                    bits.append(f"due moved to {want_due}")
+                    # cur_due == today means the event was due *today* right up
+                    # until this edit — i.e. a "due today" alert (morning
+                    # briefing / deadline_warning) may already have gone out
+                    # earlier the same day. Without this, the reconcile line
+                    # reads as a routine update instead of a contradiction of
+                    # something Simon was just told (task-postg2ap-3hnvkz,
+                    # 2026-09-12: told "due today" at 09:00, silently moved to
+                    # 09-19 at 20:00, no connection drawn between the two).
+                    if cur_due == today.isoformat():
+                        bits.append(
+                            f"due moved to {want_due} — reverses today's "
+                            f"due-today alert, that one's now stale"
+                        )
+                    else:
+                        bits.append(f"due moved to {want_due}")
                 if needs_id:
                     bits.append("belki_id backfilled onto legacy event")
                 if needs_project:
