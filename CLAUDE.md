@@ -90,7 +90,7 @@ DISCORD_BOT_TOKEN=
 DISCORD_USER_ID=
 MORNING_BRIEFING_ENABLED=true   # optional, defaults true
 TEST_MODE=false                 # optional, defaults false
-EVENINGS_PER_WEEK=6             # optional, weekly capacity split across projects
+EVENINGS_PER_WEEK=7             # optional, weekly capacity split across projects
 BELKI_PATH=/app/belki           # optional, Belki vault mount
 LEDGER_DB=data/ledger.db        # optional, SQLite ledger path
 ```

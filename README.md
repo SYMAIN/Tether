@@ -42,7 +42,7 @@ Tether manages tasks as a Sunday-based deadline queue, per project.
 New ad-hoc tasks are assigned to the next available Sunday slot.
 
 Belki-imported subtasks are packed into weeks by estimated evenings
-(`EVENINGS_PER_WEEK`, default 6) — several small subtasks share one Sunday
+(`EVENINGS_PER_WEEK`, default 7) — several small subtasks share one Sunday
 instead of each consuming a week. Subtasks without an estimate fill their
 whole week.
 
@@ -186,7 +186,7 @@ DISCORD_USER_ID=your_discord_id
 # optional
 MORNING_BRIEFING_ENABLED=true  # defaults true
 TEST_MODE=false                # fires all scheduled jobs 2 min after startup
-EVENINGS_PER_WEEK=6            # weekly capacity split across projects
+EVENINGS_PER_WEEK=7            # weekly capacity split across projects
 BELKI_PATH=/app/belki          # Belki vault mount (read-only)
 LEDGER_DB=data/ledger.db       # SQLite task-history ledger
 ```

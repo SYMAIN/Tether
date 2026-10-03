@@ -87,7 +87,7 @@ import ledger
 from ledger import clean_name
 
 BELKI_PATH = os.environ.get("BELKI_PATH", "/app/belki")
-EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "6"))
+EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "7"))
 
 # Health of a sync, so callers can tell a benign zero ("nothing new to
 # import") from a degraded one ("can't see Belki at all"). Both return
