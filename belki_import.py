@@ -1153,22 +1153,44 @@ def sync(
         if spent_dirty:
             ledger.set_state(_week_key(week), json.dumps({"alloc": alloc, "spent": spent}))
 
-        # Pick this week's work: each project contributes tasks in Belki file
-        # order (usually a dependency order) until its evening budget is used up.
+        # Pick this week's work: each project contributes its candidates in
+        # Belki priority order, then Belki file order within a priority (usually
+        # a dependency order), until its evening budget is used up. Priority
+        # first because file order alone scheduled P4s out of an old monthly
+        # file ahead of newer P2s (Simon, 2026-10-06) — which file a card lives
+        # in says nothing about how urgent it is.
         # A project already holding evenings in the target week has that counted
         # against its budget, so a mid-week sync tops up rather than doubling.
         week_key = week.isoformat()
         new_tasks: list[tuple[dict, str]] = []
         for pname in sorted(alloc, key=lambda p: (-alloc[p], p)):
             used = spent.get(pname, 0)
-            for t in importable(pname):
+            # Stable sort, so equal priorities keep importable()'s file order;
+            # cards with no/unknown priority:: weigh 0 and drop to the back.
+            candidates = sorted(
+                importable(pname),
+                key=lambda t: ledger.belki_priority_weight(t["priority"]) or 0,
+                reverse=True,
+            )
+            for t in candidates:
                 if is_fixed(t):
                     # A hard date from Belki isn't the allocator's to move.
                     new_tasks.append((t, pname))
                     continue
                 need = _need(t)
                 if used + need > alloc[pname]:
-                    break  # stop, don't skip — skipping would reorder the backlog
+                    # Stop, don't skip — skipping would let smaller cards
+                    # overtake a higher-priority one that didn't fit. Except on
+                    # a week where this project has spent nothing yet: a card
+                    # bigger than the whole budget would block the project
+                    # forever otherwise, so it takes the week and stops there.
+                    # alloc > 0 too: a project the allocator gave nothing this week
+                    # must not sneak a card in through this exception.
+                    if used == 0 and alloc[pname] > 0:
+                        used += need
+                        spent[pname] = used
+                        new_tasks.append((t, pname))
+                    break
                 used += need
                 spent[pname] = used
                 new_tasks.append((t, pname))

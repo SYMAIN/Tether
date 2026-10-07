@@ -513,6 +513,14 @@ def resolve_task(query: str, events: list[dict]) -> list[dict]:
 # --- PRIORITY ENGINE ---
 # Complexity keyword lists and infer_complexity/complexity_label/clean_name
 # live in ledger.py (shared with test_jobs.py).
+# Multiplier on the urgency weight in priority_score (raised 2 -> 5 on
+# 2026-10-06): at ×2 an overdue P4 (days_until clamps to 0) still out-ranked a
+# P2 due in 6 days, since 0 - 1*2 beats 6 - 3*2. At ×5 a P2 (weight 3)
+# out-ranks a P4 (weight 1) unless the P4 is due ~10+ days sooner. Lower score
+# is more urgent — rank_deadlines sorts ascending, and that stays.
+PRIORITY_WEIGHT_FACTOR = 5
+
+
 def priority_score(event: dict) -> float:
     today = datetime.datetime.now(TORONTO_TZ).date()
     meta = parse_meta(event)
@@ -537,7 +545,7 @@ def priority_score(event: dict) -> float:
             .strip()
         )
         weight = infer_complexity(name)
-    return days_until - (weight * 2) - (pushes * 1.5)
+    return days_until - (weight * PRIORITY_WEIGHT_FACTOR) - (pushes * 1.5)
 
 
 def rank_deadlines(deadlines: list) -> list:
@@ -842,14 +850,21 @@ def extract_reply(response, chat) -> str:
 
 
 # --- DISCORD BOT ---
+DISCORD_MESSAGE_LIMIT = 2000  # hard cap on a single Discord message
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
 async def dm_user(message: str):
+    # Discord hard-rejects anything over 2000 chars, and a raise here loses the
+    # whole message (the caller's job is already half-done by then). Slice into
+    # 2000-char chunks like the @Tether reply paths do, so a long nag/briefing
+    # arrives complete across several DMs instead of not at all.
     user = await bot.fetch_user(DISCORD_USER_ID)
-    await user.send(message)
+    for i in range(0, len(message), DISCORD_MESSAGE_LIMIT):
+        await user.send(message[i : i + DISCORD_MESSAGE_LIMIT])
     log(f"[DM] {message[:200]}")
 
 
