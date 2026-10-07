@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 import belki_import
 import ledger
 from ledger import clean_name, infer_complexity, complexity_label, belki_priority_weight
-from short_names import derive_short, normalize_query
+from short_names import derive_short, normalize_query, button_custom_id
 
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -853,6 +853,121 @@ async def dm_user(message: str):
     log(f"[DM] {message[:200]}")
 
 
+# --- NAG BUTTONS ---
+# One embed per overdue task with Done / Keep / Push buttons (2026-10-06).
+# DynamicItem + a templated custom_id makes every button persistent: after a
+# restart (frequent - see tether.log) bot.add_dynamic_items re-binds old
+# buttons by parsing the event id out of custom_id, no per-message state.
+NAG_EMBED_CAP = 10
+
+
+def _fetch_live_event(event_id: str) -> dict | None:
+    try:
+        e = get_service().events().get(calendarId="primary", eventId=event_id).execute()
+    except Exception:
+        return None
+    return None if e.get("status") == "cancelled" else e
+
+
+async def _guard(interaction: discord.Interaction) -> bool:
+    if interaction.user.id != DISCORD_USER_ID:
+        await interaction.response.send_message("Not your queue.", ephemeral=True)
+        return False
+    return True
+
+
+class PushReasonModal(discord.ui.Modal, title="Push task"):
+    reason = discord.ui.TextInput(label="Why are you pushing it?", required=True, max_length=300)
+    when = discord.ui.TextInput(
+        label="New date (optional)", required=False, placeholder="Friday / 2026-10-12",
+        max_length=40,
+    )
+
+    def __init__(self, event_id: str):
+        super().__init__()
+        self.event_id = event_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # The live fetch + do_push are blocking Google calls (can exceed the 3s
+        # interaction deadline), so acknowledge first and reply via followup.
+        await interaction.response.defer()
+        e = _fetch_live_event(self.event_id)
+        if not e:
+            await interaction.followup.send("Already handled.")
+            return
+        reason = str(self.reason.value).strip()
+        when = str(self.when.value).strip()
+        # resolve_push_date reads the raw text for date hints, same as a typed
+        # "push X to Friday because ..." - so feed it an equivalent sentence.
+        content = f"push {clean_name(e['summary'])}" + (f" to {when}" if when else "") + f" because {reason}"
+        command = {"action": "push", "task_title": clean_name(e["summary"]),
+                   "push_reason": reason, "target_date": None}
+        await interaction.followup.send(do_push(e, reason, command, content))
+
+
+class TaskActionButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"tether:(?P<action>done|keep|push):(?P<eid>[A-Za-z0-9_-]+)",
+):
+    _STYLE = {
+        "done": ("✅ Done", discord.ButtonStyle.success),
+        "keep": ("📌 Keep", discord.ButtonStyle.secondary),
+        "push": ("⏩ Push", discord.ButtonStyle.primary),
+    }
+
+    def __init__(self, action: str, event_id: str):
+        label, style = self._STYLE[action]
+        super().__init__(discord.ui.Button(
+            label=label, style=style, custom_id=button_custom_id(action, event_id),
+        ))
+        self.action = action
+        self.event_id = event_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["action"], match["eid"])
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await _guard(interaction):
+            return
+        if self.action == "push":
+            # The modal must be the first response; it re-checks liveness on submit.
+            await interaction.response.send_modal(PushReasonModal(self.event_id))
+            return
+        # Live fetch + do_complete/do_keep hit Google (blocking) - defer so the
+        # 3s interaction window can't expire, then answer via followup.
+        await interaction.response.defer()
+        e = _fetch_live_event(self.event_id)
+        if not e:
+            await interaction.followup.send("Already handled.")
+            return
+        reply = do_complete(e) if self.action == "done" else do_keep(e)
+        await interaction.followup.send(reply)
+
+
+def nag_view(event_id: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for action in ("done", "keep", "push"):
+        view.add_item(TaskActionButton(action, event_id))
+    return view
+
+
+def build_nag_embed(e: dict, session_nag_count: int) -> discord.Embed:
+    meta = parse_meta(e)
+    embed = discord.Embed(
+        title=task_label(e)[:256],
+        description=nag_message(e, session_nag_count)[:4096],
+    )
+    embed.add_field(name="Priority", value=str(meta.get("priority") or "-")[:1024])
+    embed.add_field(name="Due", value=e["start"]["dateTime"][:10])
+    embed.add_field(name="Project", value=str(meta.get("project") or "-")[:1024])
+    embed.add_field(
+        name="Pressure",
+        value=f"{meta['pushes']} pushes · {meta['nag_ignored'] + session_nag_count} ignored",
+    )
+    return embed
+
+
 # --- NAG LOOP ---
 # 23:00-08:00 Toronto: the phone still lights up, just once an hour instead
 # of every 30 min. Reconciliation still runs every cycle either way (see
@@ -904,12 +1019,19 @@ async def send_overdue_nag():
     if _in_quiet_hours(now) and now.minute >= 30:
         return
 
-    lines = [nag_summary_header(nag_count)]
-    for e in pending:
+    user = await bot.fetch_user(DISCORD_USER_ID)
+    await dm_user(nag_summary_header(nag_count).strip())
+    # priority_score: LOWER = more urgent (rank_deadlines sorts ascending).
+    ranked = sorted(pending, key=priority_score)
+    for e in ranked[:NAG_EMBED_CAP]:
         eid = e["id"]
-        lines.append(nag_message(e, task_nag_counts.get(eid, 0)))
+        await user.send(embed=build_nag_embed(e, task_nag_counts.get(eid, 0)), view=nag_view(eid))
         task_nag_counts[eid] = task_nag_counts.get(eid, 0) + 1
-    await dm_user("\n".join(lines))
+    rest = ranked[NAG_EMBED_CAP:]
+    if rest:
+        await dm_user(f"...and {len(rest)} more: " + ", ".join(task_label(e) for e in rest))
+        for e in rest:
+            task_nag_counts[e["id"]] = task_nag_counts.get(e["id"], 0) + 1
     nag_count += 1
     log(f"[NAG #{nag_count}] {len(pending)} unacknowledged tasks")
 
@@ -1440,6 +1562,8 @@ async def on_ready():
         # of the still-running one, so jobs fire multiple times per cron tick.
         return
     _started = True
+    # Re-bind nag buttons from earlier messages (they outlive the process).
+    bot.add_dynamic_items(TaskActionButton)
 
     nag_count = 0
     unacknowledged_overdue = set()
