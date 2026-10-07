@@ -1336,7 +1336,11 @@ async def handle_push_with_reason(command: dict, content: str, message):
             f"Multiple matches: {names}. Be more specific.", mention_author=False
         )
         return
-    e = matches[0]
+    await message.reply(do_push(matches[0], push_reason, command, content), mention_author=False)
+
+
+def do_push(e: dict, push_reason: str, command: dict, content: str) -> str:
+    """Push one resolved event. Shared by the text `push` command and the Push button."""
     event_id = e["id"]
     meta = parse_meta(e)
     desc = e.get("description", "") or ""
@@ -1373,14 +1377,13 @@ async def handle_push_with_reason(command: dict, content: str, message):
         if runway_capped
         else ""
     )
-    await message.reply(
-        f"📅 **{task_label(e)}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
-        f"Push #{meta['pushes']}.{fallback_note}{cap_note}",
-        mention_author=False,
-    )
     log(
         f"[PUSH] {name} → {target_date} | reason: {push_reason} | pushes: {meta['pushes']}"
         + (" | runway capped" if runway_capped else "")
+    )
+    return (
+        f"📅 **{task_label(e)}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
+        f"Push #{meta['pushes']}.{fallback_note}{cap_note}"
     )
 
 
@@ -1393,9 +1396,12 @@ async def handle_keep(command: dict, message):
             f"No task matching **{task_title}** found.", mention_author=False
         )
         return
-    e = matches[0]
+    await message.reply(do_keep(matches[0]), mention_author=False)
+
+
+def do_keep(e: dict) -> str:
+    """Acknowledge one resolved event without changing it. Returns the reply text."""
     event_id = e["id"]
-    name = clean_name(e["summary"])
     unacknowledged_overdue.discard(event_id)
     # Without this, send_overdue_nag's next cycle re-adds event_id straight
     # back into unacknowledged_overdue and the discard above is meaningless —
@@ -1404,11 +1410,25 @@ async def handle_keep(command: dict, message):
     # next day rather than going silent forever.
     kept_today.add(event_id)
     ledger.record_kept(e)
-    await message.reply(
-        f"✅ Got it — **{task_label(e)}** stays. I won't nag about it again today.",
-        mention_author=False,
-    )
-    log(f"[KEEP] {name} acknowledged, suppressed until midnight")
+    log(f"[KEEP] {clean_name(e['summary'])} acknowledged, suppressed until midnight")
+    return f"✅ Got it — **{task_label(e)}** stays. I won't nag about it again today."
+
+
+def do_complete(e: dict) -> str:
+    """Complete (delete) one resolved event. Returns the reply text."""
+    get_service().events().delete(calendarId="primary", eventId=e["id"]).execute()
+    ledger.record_completed(e)
+    unacknowledged_overdue.discard(e["id"])
+    task_nag_counts.pop(e["id"], None)
+    log(f"[COMPLETE] {clean_name(e['summary'])}")
+    remaining = get_tether_deadlines()
+    if remaining:
+        nxt = rank_deadlines(remaining)[0]
+        return (
+            f"✅ **{task_label(e)}** done. Up next: **{task_label(nxt)}** — "
+            f"due {nxt['start']['dateTime'][:10]}."
+        )
+    return f"✅ **{task_label(e)}** done. Queue is clear."
 
 
 @bot.event
@@ -1637,26 +1657,7 @@ async def on_message(message):
                     )
                     return
                 e = matches[0]
-                name = clean_name(e["summary"])
-                label = task_label(e)
-                get_service().events().delete(calendarId="primary", eventId=e["id"]).execute()
-                ledger.record_completed(e)
-                unacknowledged_overdue.discard(e["id"])
-                task_nag_counts.pop(e["id"], None)
-                remaining = get_tether_deadlines()
-                if remaining:
-                    ranked = rank_deadlines(remaining)
-                    next_name = task_label(ranked[0])
-                    next_due = ranked[0]["start"]["dateTime"][:10]
-                    await message.reply(
-                        f"✅ **{label}** done. Up next: **{next_name}** — due {next_due}.",
-                        mention_author=False,
-                    )
-                else:
-                    await message.reply(
-                        f"✅ **{label}** done. Queue is clear.", mention_author=False
-                    )
-                log(f"[COMPLETE] {name}")
+                await message.reply(do_complete(e), mention_author=False)
                 return
 
             # --- QUERY ---
