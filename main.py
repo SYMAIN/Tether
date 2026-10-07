@@ -586,8 +586,8 @@ def priority_reason(event: dict) -> str:
 # encouraging, per the "accountability over motivation" decision — vary the
 # words, not the attitude.
 _NAG_TIER_0 = [
-    "⚠️ **{name}** wasn't completed{orig_str}. Keep or push back? (`@Tether push {name} because <reason>` — I'll pick the date)",
-    "⚠️ **{name}** is now overdue{orig_str}. Tell me it's staying or tell me why it's moving. (`@Tether push {name} because <reason>`)",
+    "⚠️ **{name}** wasn't completed{orig_str}. Keep or push back? (`@Tether push {ref} because <reason>` — I'll pick the date)",
+    "⚠️ **{name}** is now overdue{orig_str}. Tell me it's staying or tell me why it's moving. (`@Tether push {ref} because <reason>`)",
     "⚠️ **{name}** — the date passed. Keep or push back?",
 ]
 
@@ -647,8 +647,9 @@ def nag_message(event: dict, session_nag_count: int) -> str:
         pool = _NAG_TIER_MAX
 
     template = random.choice(pool)
+    ref = event_short(event) or clean_name(event.get("summary", ""))
     return template.format(
-        name=name, orig_str=orig_str, reason_str=reason_str, pushes=pushes, ignored=ignored
+        name=name, ref=ref, orig_str=orig_str, reason_str=reason_str, pushes=pushes, ignored=ignored
     )
 
 
