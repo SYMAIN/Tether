@@ -890,19 +890,27 @@ class PushReasonModal(discord.ui.Modal, title="Push task"):
     async def on_submit(self, interaction: discord.Interaction):
         # The live fetch + do_push are blocking Google calls (can exceed the 3s
         # interaction deadline), so acknowledge first and reply via followup.
-        await interaction.response.defer()
-        e = _fetch_live_event(self.event_id)
-        if not e:
-            await interaction.followup.send("Already handled.")
+        # Defence in depth: the button already guarded, but a modal submit is
+        # its own interaction. _guard sends the one initial response on reject.
+        if not await _guard(interaction):
             return
-        reason = str(self.reason.value).strip()
-        when = str(self.when.value).strip()
-        # resolve_push_date reads the raw text for date hints, same as a typed
-        # "push X to Friday because ..." - so feed it an equivalent sentence.
-        content = f"push {clean_name(e['summary'])}" + (f" to {when}" if when else "") + f" because {reason}"
-        command = {"action": "push", "task_title": clean_name(e["summary"]),
-                   "push_reason": reason, "target_date": None}
-        await interaction.followup.send(do_push(e, reason, command, content))
+        await interaction.response.defer()
+        try:
+            e = _fetch_live_event(self.event_id)
+            if not e:
+                await interaction.followup.send("Already handled.")
+                return
+            reason = str(self.reason.value).strip()
+            when = str(self.when.value).strip()
+            # resolve_push_date reads the raw text for date hints, same as a typed
+            # "push X to Friday because ..." - so feed it an equivalent sentence.
+            content = f"push {clean_name(e['summary'])}" + (f" to {when}" if when else "") + f" because {reason}"
+            command = {"action": "push", "task_title": clean_name(e["summary"]),
+                       "push_reason": reason, "target_date": None}
+            await interaction.followup.send(do_push(e, reason, command, content))
+        except Exception as ex:
+            log(f"[BUTTON] push failed: {ex}")
+            await interaction.followup.send("Something went wrong — try the text command.")
 
 
 class TaskActionButton(
@@ -937,12 +945,18 @@ class TaskActionButton(
         # Live fetch + do_complete/do_keep hit Google (blocking) - defer so the
         # 3s interaction window can't expire, then answer via followup.
         await interaction.response.defer()
-        e = _fetch_live_event(self.event_id)
-        if not e:
-            await interaction.followup.send("Already handled.")
-            return
-        reply = do_complete(e) if self.action == "done" else do_keep(e)
-        await interaction.followup.send(reply)
+        # After defer() an unhandled error leaves Discord showing "thinking..."
+        # forever, so always close the loop with a followup.
+        try:
+            e = _fetch_live_event(self.event_id)
+            if not e:
+                await interaction.followup.send("Already handled.")
+                return
+            reply = do_complete(e) if self.action == "done" else do_keep(e)
+            await interaction.followup.send(reply)
+        except Exception as ex:
+            log(f"[BUTTON] {self.action} failed: {ex}")
+            await interaction.followup.send("Something went wrong — try the text command.")
 
 
 def nag_view(event_id: str) -> discord.ui.View:
@@ -1019,17 +1033,42 @@ async def send_overdue_nag():
     if _in_quiet_hours(now) and now.minute >= 30:
         return
 
-    user = await bot.fetch_user(DISCORD_USER_ID)
-    await dm_user(nag_summary_header(nag_count).strip())
+    # Every send below is isolated: one failed DM (Discord 4xx, transient
+    # network) must not abort the cycle, and the nag accounting (counts,
+    # nag_count) must not depend on whether a send landed - otherwise a
+    # persistently failing send would freeze escalation for these tasks.
+    user = None
+    try:
+        user = await bot.fetch_user(DISCORD_USER_ID)
+    except Exception as ex:
+        log(f"[NAG] fetch_user failed: {ex}")
+    try:
+        await dm_user(nag_summary_header(nag_count).strip())
+    except Exception as ex:
+        log(f"[NAG] header send failed: {ex}")
     # priority_score: LOWER = more urgent (rank_deadlines sorts ascending).
     ranked = sorted(pending, key=priority_score)
     for e in ranked[:NAG_EMBED_CAP]:
         eid = e["id"]
-        await user.send(embed=build_nag_embed(e, task_nag_counts.get(eid, 0)), view=nag_view(eid))
+        try:
+            if user is None:
+                raise RuntimeError("no user handle")
+            await user.send(embed=build_nag_embed(e, task_nag_counts.get(eid, 0)), view=nag_view(eid))
+        except Exception as ex:
+            log(f"[NAG] embed send failed for {eid}: {ex}")
         task_nag_counts[eid] = task_nag_counts.get(eid, 0) + 1
     rest = ranked[NAG_EMBED_CAP:]
     if rest:
-        await dm_user(f"...and {len(rest)} more: " + ", ".join(task_label(e) for e in rest))
+        # Discord rejects messages over 2000 chars; cap the joined list below
+        # that and mark the cut so a long backlog can't kill the overflow DM.
+        overflow_cap = 1900
+        names = ", ".join(task_label(e) for e in rest)
+        if len(names) > overflow_cap:
+            names = names[:overflow_cap].rsplit(", ", 1)[0] + ", …"
+        try:
+            await dm_user(f"...and {len(rest)} more: " + names)
+        except Exception as ex:
+            log(f"[NAG] overflow send failed: {ex}")
         for e in rest:
             task_nag_counts[e["id"]] = task_nag_counts.get(e["id"], 0) + 1
     nag_count += 1
