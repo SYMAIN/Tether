@@ -18,6 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 import belki_import
 import ledger
 from ledger import clean_name, infer_complexity, complexity_label, belki_priority_weight
+from short_names import derive_short, normalize_query
 
 # --- CONFIG ---
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -486,6 +487,29 @@ def task_matches(query: str, event: dict) -> bool:
     )
 
 
+def event_short(event: dict) -> str | None:
+    meta = parse_meta(event)
+    return derive_short(meta.get("belki_id"), meta.get("short"))
+
+
+def task_label(event: dict) -> str:
+    """`[endcard1] End card: …` — the handle Simon can type back verbatim."""
+    name = clean_name(event.get("summary", ""))
+    short = event_short(event)
+    return f"[{short}] {name}" if short else name
+
+
+def resolve_task(query: str, events: list[dict]) -> list[dict]:
+    # Exact short-name hit wins outright: the whole point of a handle is that
+    # it names one task even when a project has 17 open cards and the
+    # project-word match below would return "Multiple matches".
+    q = normalize_query(query)
+    exact = [e for e in events if q and event_short(e) == q]
+    if exact:
+        return exact
+    return [e for e in events if task_matches(query, e)]
+
+
 # --- PRIORITY ENGINE ---
 # Complexity keyword lists and infer_complexity/complexity_label/clean_name
 # live in ledger.py (shared with test_jobs.py).
@@ -600,12 +624,7 @@ def nag_message(event: dict, session_nag_count: int) -> str:
     meta = parse_meta(event)
     pushes = meta["pushes"]
     nag_ignored = meta.get("nag_ignored", 0)
-    name = (
-        event.get("summary", "")
-        .replace(DEADLINE_PREFIX, "")
-        .replace("— DUE", "")
-        .strip()
-    )
+    name = task_label(event)
     desc = event.get("description", "") or ""
     orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
     orig_str = (
@@ -686,6 +705,7 @@ Rules:
 - action "keep": user says keep, it's staying, I'll do it — acknowledges an overdue task without pushing
 - action "sync": user asks to sync/import tasks from Belki (e.g. "sync belki"). task_title = the project name if the user names one, else null
 - action "clarify": ONLY when you cannot determine action or task with confidence >= {CONFIDENCE_THRESHOLD}
+- task_title: if the user writes a short handle like "endcard1" or "[endcard1]", return it verbatim as task_title (without brackets)
 - push_reason: extract any reason or explanation the user gives for pushing — from "because <reason>", "since <reason>", or any explanation in the message. null if no reason given
 - urgency "asap": only if user says urgent / ASAP / emergency
 - target_date: nearest future date matching what the user said (e.g. "by Friday" → next Friday as YYYY-MM-DD, "before July" → last day of June as YYYY-MM-DD, "before [month]" → last day of the prior month); null if not given
@@ -935,8 +955,7 @@ async def morning_briefing():
     overdue = get_overdue_tether_events()
     overdue_lines = []
     for e in overdue:
-        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
-        overdue_lines.append(f"• ⚠️ {name} — OVERDUE")
+        overdue_lines.append(f"• ⚠️ {task_label(e)} — OVERDUE")
 
     all_events = list_upcoming_events(20)
     today_events = [
@@ -954,7 +973,7 @@ async def morning_briefing():
     next_line = ""
     if deadlines:
         top = rank_deadlines(deadlines)[0]
-        name = top["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        name = task_label(top)
         reason = priority_reason(top)
         # Which project it belongs to matters now that the queue holds several.
         tag = parse_meta(top).get("project")
@@ -991,7 +1010,7 @@ async def deadline_warning():
     upcoming = get_events_in_window(hours_from_now=24)
     today = datetime.datetime.now(TORONTO_TZ).date()
     for e in upcoming:
-        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        name = task_label(e)
         start = datetime.datetime.fromisoformat(e["start"]["dateTime"])
         if start.tzinfo is None:
             start = TORONTO_TZ.localize(start)
@@ -1008,7 +1027,7 @@ async def weekly_queue_summary():
     ranked = rank_deadlines(deadlines)
     lines = ["📋 **Weekly Queue** _(by priority)_:\n"]
     for i, e in enumerate(ranked):
-        name = e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
+        name = task_label(e)
         date_str = e["start"]["dateTime"][:10]
         meta = parse_meta(e)
         if meta.get("project"):
@@ -1304,19 +1323,14 @@ async def handle_push_with_reason(command: dict, content: str, message):
     task_title = command.get("task_title") or ""
     push_reason = command.get("push_reason", "")
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
-    matches = [
-        e for e in all_tasks if task_matches(task_title, e)
-    ]
+    matches = resolve_task(task_title, all_tasks)
     if not matches:
         await message.reply(
             f"No task matching **{task_title}** found.", mention_author=False
         )
         return
     if len(matches) > 1:
-        names = ", ".join(
-            e["summary"].replace(DEADLINE_PREFIX, "").replace("— DUE", "").strip()
-            for e in matches
-        )
+        names = ", ".join(task_label(e) for e in matches)
         await message.reply(
             f"Multiple matches: {names}. Be more specific.", mention_author=False
         )
@@ -1359,7 +1373,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
         else ""
     )
     await message.reply(
-        f"📅 **{name}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
+        f"📅 **{task_label(e)}** pushed to **{target_date}**. Reason logged: _{push_reason}_. "
         f"Push #{meta['pushes']}.{fallback_note}{cap_note}",
         mention_author=False,
     )
@@ -1372,9 +1386,7 @@ async def handle_push_with_reason(command: dict, content: str, message):
 async def handle_keep(command: dict, message):
     task_title = command.get("task_title") or ""
     all_tasks = get_overdue_tether_events() + get_tether_deadlines()
-    matches = [
-        e for e in all_tasks if task_matches(task_title, e)
-    ]
+    matches = resolve_task(task_title, all_tasks)
     if not matches:
         await message.reply(
             f"No task matching **{task_title}** found.", mention_author=False
@@ -1392,7 +1404,7 @@ async def handle_keep(command: dict, message):
     kept_today.add(event_id)
     ledger.record_kept(e)
     await message.reply(
-        f"✅ Got it — **{name}** stays. I won't nag about it again today.",
+        f"✅ Got it — **{task_label(e)}** stays. I won't nag about it again today.",
         mention_author=False,
     )
     log(f"[KEEP] {name} acknowledged, suppressed until midnight")
@@ -1598,12 +1610,7 @@ async def on_message(message):
                     )
                     return
                 top = rank_deadlines(deadlines)[0]
-                name = (
-                    top["summary"]
-                    .replace(DEADLINE_PREFIX, "")
-                    .replace("— DUE", "")
-                    .strip()
-                )
+                name = task_label(top)
                 reason = priority_reason(top)
                 await message.reply(f"🔴 **{name}** — {reason}.", mention_author=False)
                 return
@@ -1614,7 +1621,7 @@ async def on_message(message):
                 deadlines = get_tether_deadlines()
                 overdue = get_overdue_tether_events()
                 all_tasks = overdue + deadlines
-                matches = [e for e in all_tasks if task_matches(task_title, e)]
+                matches = resolve_task(task_title, all_tasks)
                 if not matches:
                     await message.reply(
                         f"No scheduled task matching **{task_title}**.",
@@ -1622,25 +1629,15 @@ async def on_message(message):
                     )
                     return
                 if len(matches) > 1:
-                    names = ", ".join(
-                        e["summary"]
-                        .replace(DEADLINE_PREFIX, "")
-                        .replace("— DUE", "")
-                        .strip()
-                        for e in matches
-                    )
+                    names = ", ".join(task_label(e) for e in matches)
                     await message.reply(
                         f"Multiple matches: {names}. Be more specific.",
                         mention_author=False,
                     )
                     return
                 e = matches[0]
-                name = (
-                    e["summary"]
-                    .replace(DEADLINE_PREFIX, "")
-                    .replace("— DUE", "")
-                    .strip()
-                )
+                name = clean_name(e["summary"])
+                label = task_label(e)
                 get_service().events().delete(calendarId="primary", eventId=e["id"]).execute()
                 ledger.record_completed(e)
                 unacknowledged_overdue.discard(e["id"])
@@ -1648,20 +1645,15 @@ async def on_message(message):
                 remaining = get_tether_deadlines()
                 if remaining:
                     ranked = rank_deadlines(remaining)
-                    next_name = (
-                        ranked[0]["summary"]
-                        .replace(DEADLINE_PREFIX, "")
-                        .replace("— DUE", "")
-                        .strip()
-                    )
+                    next_name = task_label(ranked[0])
                     next_due = ranked[0]["start"]["dateTime"][:10]
                     await message.reply(
-                        f"✅ **{name}** done. Up next: **{next_name}** — due {next_due}.",
+                        f"✅ **{label}** done. Up next: **{next_name}** — due {next_due}.",
                         mention_author=False,
                     )
                 else:
                     await message.reply(
-                        f"✅ **{name}** done. Queue is clear.", mention_author=False
+                        f"✅ **{label}** done. Queue is clear.", mention_author=False
                     )
                 log(f"[COMPLETE] {name}")
                 return
@@ -1670,7 +1662,7 @@ async def on_message(message):
             if command.get("action") == "query":
                 task_title = command.get("task_title") or ""
                 deadlines = get_tether_deadlines()
-                matches = [e for e in deadlines if task_matches(task_title, e)]
+                matches = resolve_task(task_title, deadlines)
                 if not matches:
                     await message.reply(
                         f"No scheduled task matching **{task_title}**.",
@@ -1678,12 +1670,7 @@ async def on_message(message):
                     )
                 else:
                     e = matches[0]
-                    name = (
-                        e["summary"]
-                        .replace(DEADLINE_PREFIX, "")
-                        .replace("— DUE", "")
-                        .strip()
-                    )
+                    name = task_label(e)
                     due = e["start"]["dateTime"][:10]
                     await message.reply(
                         f"**{name}** is due {due}.", mention_author=False
