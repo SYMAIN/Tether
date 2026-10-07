@@ -95,6 +95,7 @@ def build_meta(
     belki_id="",
     project="",
     priority="",
+    short="",
     **_ignored,  # tolerate a stray key from a previously-corrupted meta block
                  # rather than raising mid-reconcile (parse_meta now filters,
                  # but events written before that fix may still carry one)
@@ -123,6 +124,10 @@ def build_meta(
     # P2 just because its title happens to match a complexity keyword.
     if priority not in ("", None):
         meta += f"priority={priority}\n"
+    # Optional Belki short:: override for the [handle] shown in DMs. Absent →
+    # the handle is derived from belki_id at display time (event_short()).
+    if short not in ("", None):
+        meta += f"short={short}\n"
     return meta
 
 
@@ -191,6 +196,7 @@ def _insert_deadline(
     project: str | None = None,
     belki_id: str | None = None,
     priority: str | None = None,
+    short: str | None = None,
 ):
     """Internal insert used by both the Gemini tool and the Belki import."""
     # Hard override: Gemini sometimes passes midnight — force to 23:59
@@ -204,6 +210,7 @@ def _insert_deadline(
         belki_id=belki_id or "",
         project=project or "",
         priority=priority or "",
+        short=short or "",
     )
     due_date = start_time[:10]
     description = f"{meta}\nOriginally due: {due_date}"
@@ -259,6 +266,7 @@ def update_deadline_content(
     belki_id: str | None = None,
     project: str | None = None,
     priority: str | None = None,
+    short: str | None = None,
 ):
     """Updates title/description/due date of a belki-tracked event in place.
 
@@ -287,6 +295,10 @@ def update_deadline_content(
         meta["project"] = project
     if priority:
         meta["priority"] = priority
+    # Unconditional (unlike the fields above): reconcile calls this when a
+    # card's short:: was *removed*, and an empty value is how build_meta drops
+    # the line so the handle falls back to the derived one.
+    meta["short"] = short or ""
 
     description = build_meta(**meta)
     description += f"\nOriginally due: {original_due}"

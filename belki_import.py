@@ -85,6 +85,7 @@ import re
 
 import ledger
 from ledger import clean_name
+from short_names import derive_short, find_collisions
 
 BELKI_PATH = os.environ.get("BELKI_PATH", "/app/belki")
 EVENINGS_PER_WEEK = int(os.environ.get("EVENINGS_PER_WEEK", "7"))
@@ -129,12 +130,13 @@ _ANYKEY_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)::(?:\s|$)")
 # nothing (Simon lost time to `deadline:: 2026-09-12` on 2026-09-01).
 _KNOWN_TASK_KEYS = frozenset(
     {"estimate", "est", "due", "project", "description", "id", "priority",
-     "created", "labels", "completed", "depends_on", "status"}
+     "created", "labels", "completed", "depends_on", "status", "short"}
 )
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
 _META_PROJECT_RE = re.compile(r"^project=(.+)$", re.M)
 _META_PRIORITY_RE = re.compile(r"^priority=(.+)$", re.M)
+_META_SHORT_RE = re.compile(r"^short=(.+)$", re.M)
 _META_BODY_RE = re.compile(r"Originally due: \d{4}-\d{2}-\d{2}\n\n(.*)", re.DOTALL)
 
 
@@ -185,6 +187,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 "priority": None,
                 "depends_on": None,
                 "status": None,
+                "short": None,
             }
             tasks.append(current)
             continue
@@ -221,6 +224,8 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 current["depends_on"] = val
             elif key == "status":
                 current["status"] = val.lower()
+            elif key == "short":
+                current["short"] = val.strip().lower() or None
             elif key not in _KNOWN_TASK_KEYS and not current["done"] and not in_desc_wrap:
                 notes.append(_unknown_key_note(current["name"], key))
             continue
@@ -276,6 +281,24 @@ def load_tasks(belki_path: str = None) -> tuple[list[dict], list[str], list[str]
                 seen_ids.add(t["id"])
             tasks.append(t)
     return tasks, skipped, notes
+
+
+def short_name_collision_notes(tasks: list[dict]) -> list[str]:
+    """Flags open tasks sharing an effective short name.
+
+    Two cards answering to `[endcard1]` make the exact-match lookup ambiguous,
+    which is exactly what short names exist to prevent — surface it on sync so
+    the fix (a `short::` on one of them) happens at the source.
+    """
+    pairs = [
+        (derive_short(t["id"], t.get("short")), t["name"])
+        for t in tasks
+        if not t["done"]
+    ]
+    return [
+        f'short name "{s}" shared by: ' + ", ".join(n[:60] for n in names)
+        for s, names in find_collisions(pairs).items()
+    ]
 
 
 def annotate_dependencies(tasks: list[dict]) -> list[str]:
@@ -765,7 +788,7 @@ def sync(
         )
 
     tasks, skipped, notes = load_tasks()
-    notes = notes + annotate_dependencies(tasks)
+    notes = notes + annotate_dependencies(tasks) + short_name_collision_notes(tasks)
     queue_by_name = {clean_name(e.get("summary", "")).lower(): e for e in deadlines}
     queue_names = set(queue_by_name)
     queue_by_id = {}
@@ -1061,6 +1084,11 @@ def sync(
                 cur_priority_match = _META_PRIORITY_RE.search(cur_desc)
                 cur_priority = cur_priority_match.group(1).strip() if cur_priority_match else None
                 priority_changed = bool(t["priority"]) and t["priority"] != cur_priority
+                # Unlike priority, a removed short:: must propagate too (the event
+                # would otherwise keep answering to a handle the card dropped).
+                cur_short_match = _META_SHORT_RE.search(cur_desc)
+                cur_short = cur_short_match.group(1).strip() if cur_short_match else None
+                short_changed = (t["short"] or None) != cur_short
                 # A legacy event registered by the backfill pass above carries no
                 # belki_id yet. Stamp it even when nothing else differs — that is
                 # the whole point of the backfill, and without this the id would
@@ -1073,7 +1101,7 @@ def sync(
                 needs_project = not _META_PROJECT_RE.search(cur_desc)
                 if not (
                     name_changed or desc_changed or due_changed or needs_id or needs_project
-                    or priority_changed
+                    or priority_changed or short_changed
                 ):
                     continue
                 new_summary = f"{ledger.DEADLINE_PREFIX} {t['name']} — DUE"
@@ -1081,6 +1109,7 @@ def sync(
                     update_deadline(
                         event["id"], new_summary, want_due, t["description"] or None, t["estimate"],
                         belki_id=t["id"], project=t["project"], priority=t["priority"],
+                        short=t["short"],
                     )
                 except Exception as e:
                     sync_errors.append(
@@ -1213,6 +1242,7 @@ def sync(
                     project=pname,
                     belki_id=t["id"],
                     priority=t["priority"],
+                    short=t["short"],
                 )
             except Exception as e:
                 sync_errors.append(
