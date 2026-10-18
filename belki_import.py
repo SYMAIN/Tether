@@ -130,8 +130,11 @@ _ANYKEY_RE = re.compile(r"^\s+([A-Za-z0-9_-]+)::(?:\s|$)")
 # nothing (Simon lost time to `deadline:: 2026-09-12` on 2026-09-01).
 _KNOWN_TASK_KEYS = frozenset(
     {"estimate", "est", "due", "project", "description", "id", "priority",
-     "created", "labels", "completed", "depends_on", "status", "short"}
+     "created", "labels", "completed", "depends_on", "status", "short",
+     "update"}
 )
+# Free-text fields whose wrapped lines may quote `key::` prose.
+_PROSE_KEYS = frozenset({"description", "update"})
 _META_EST_RE = re.compile(r"estimate=(\d+)")
 _META_ID_RE = re.compile(r"belki_id=(\S+)")
 _META_PROJECT_RE = re.compile(r"^project=(.+)$", re.M)
@@ -165,7 +168,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
     skipped: list[str] = []
     notes: list[str] = []
     current: dict | None = None
-    last_field_key: str | None = None  # for spotting description:: continuations
+    last_field_key: str | None = None  # for spotting description::/update:: continuations
 
     for line in lines:
         match = _CHECKBOX_RE.match(line)
@@ -198,7 +201,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
             # wrapped continuation of that prose, not a new field — don't flag
             # an unknown key on it (known keys still parse), and keep the
             # description context so a multi-line wrap stays covered.
-            in_desc_wrap = last_field_key == "description"
+            in_desc_wrap = last_field_key in _PROSE_KEYS
             if key in _KNOWN_TASK_KEYS or not in_desc_wrap:
                 last_field_key = key
             if key in ("estimate", "est"):
@@ -230,7 +233,7 @@ def parse_data_file(path: str) -> tuple[list[dict], list[str], list[str]]:
                 notes.append(_unknown_key_note(current["name"], key))
             continue
         anykey = _ANYKEY_RE.match(line)
-        if anykey and current and not current["done"] and last_field_key != "description":
+        if anykey and current and not current["done"] and last_field_key not in _PROSE_KEYS:
             # An indented `key:: value` _FIELD_RE wouldn't match (digit or
             # hyphen in the key). Still a field the writer meant to set —
             # unless we're inside a wrapped description, where it's just prose.

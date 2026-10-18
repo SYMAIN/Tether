@@ -40,3 +40,19 @@ def test_collision_ignores_done_tasks(tmp_path):
     tasks, _s, _n = _parse(tmp_path)
     tasks[2]["done"] = True
     assert belki_import.short_name_collision_notes(tasks) == []
+
+
+UPDATE_CARD = """- [ ] Card with progress notes
+  id:: task-updnote1-abc123
+  project:: Tether
+  update:: 2026-10-18 verified on device; next step
+    is the merge, see deadline:: notes in the PR
+"""
+
+
+def test_update_field_not_flagged_unknown(tmp_path):
+    p = tmp_path / "2026-10.md"
+    p.write_text(UPDATE_CARD, encoding="utf-8")
+    tasks, _skipped, notes = belki_import.parse_data_file(str(p))
+    assert len(tasks) == 1
+    assert notes == []
