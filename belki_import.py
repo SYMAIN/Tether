@@ -444,7 +444,8 @@ def allocate_evenings(
 
     projects: registry from load_projects(). Advisory — a project with open
     tasks but no registry entry is treated as active with no deadline, so
-    forgetting to register something never makes its work invisible.
+    forgetting to register something never makes its work invisible; any
+    such unregistered project is named in the returned lines.
     last_activity: fn(project) -> days since that project last moved, or None
     if it never has. Only orders projects that have no deadline to compete on.
 
@@ -459,10 +460,17 @@ def allocate_evenings(
             open_by_project.setdefault(t["project"], []).append(t)
 
     eligible: dict[str, dict] = {}
+    unregistered: list[str] = []
     for name, ts in open_by_project.items():
         entry = _registry(projects, name)
         if entry and entry.get("status", "active") != "active":
             continue
+        # Named, not just silently treated as active: an unregistered project
+        # is usually a forgotten projects.md line, and the split is the only
+        # place that gap is visible. An empty registry is reported by
+        # load_projects() itself, so it isn't repeated here.
+        if not entry and projects:
+            unregistered.append(name)
         eligible[name] = {
             # Blocked (open depends_on::) and parked (status:: parked) tasks
             # don't count toward what a project can spend this week —
@@ -565,6 +573,11 @@ def allocate_evenings(
         )
     if overdue:
         lines.append(f"🔴 Past its project deadline: {', '.join(sorted(overdue))}.")
+    if unregistered:
+        lines.append(
+            '❓ Not in projects.md, treated as active: '
+            + ', '.join(sorted(unregistered)) + '.'
+        )
     for name in sorted(alloc, key=lambda k: (-alloc[k], k)):
         info = eligible[name]
         due_note = f" · due {info['due']}" if info["due"] else ""
