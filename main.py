@@ -920,8 +920,14 @@ class PushReasonModal(discord.ui.Modal, title="Push task"):
             # resolve_push_date reads the raw text for date hints, same as a typed
             # "push X to Friday because ..." - so feed it an equivalent sentence.
             content = f"push {clean_name(e['summary'])}" + (f" to {when}" if when else "") + f" because {reason}"
+            target_date = None
+            try:
+                target_date = datetime.date.fromisoformat(when).isoformat() if when else None
+            except ValueError:
+                pass
             command = {"action": "push", "task_title": clean_name(e["summary"]),
-                       "push_reason": reason, "target_date": None}
+                       "push_reason": reason, "target_date": target_date,
+                       "explicit_when": bool(when)}
             await interaction.followup.send(do_push(e, reason, command, content))
         except Exception as ex:
             log(f"[BUTTON] push failed: {ex}")
@@ -1444,8 +1450,11 @@ def resolve_push_date(
             pass
 
     # Belki estimates are integer evenings; 1 evening ≈ 1 calendar day of runway
+    # A user-typed date that wasn't ISO (e.g. "Friday" from the Push modal) must
+    # reach the AI picker, which reads it from `content` — estimate arithmetic
+    # would silently override it.
     estimate = meta.get("estimate")
-    if estimate:
+    if estimate and not command.get("explicit_when"):
         try:
             est = int(estimate)
             candidate = today + datetime.timedelta(days=est)
