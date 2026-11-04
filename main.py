@@ -989,17 +989,39 @@ def nag_view(event_id: str) -> discord.ui.View:
 
 def build_nag_embed(e: dict, session_nag_count: int) -> discord.Embed:
     meta = parse_meta(e)
-    embed = discord.Embed(
-        title=task_label(e)[:256],
-        description=nag_message(e, session_nag_count)[:4096],
+    name = clean_name(e.get("summary", ""))
+    short = event_short(e)
+    pushes = meta["pushes"]
+    ignored = meta.get("nag_ignored", 0) + session_nag_count
+    pressure = pushes + ignored
+    # The title already carries the full name; the nag line only needs a
+    # short reference so the embed doesn't print the name twice.
+    text = nag_message(e, session_nag_count).replace(
+        f"**{task_label(e)}**", f"**{short}**" if short else "**This**", 1
     )
-    embed.add_field(name="Priority", value=str(meta.get("priority") or "-")[:1024])
-    embed.add_field(name="Due", value=e["start"]["dateTime"][:10])
-    embed.add_field(name="Project", value=str(meta.get("project") or "-")[:1024])
-    embed.add_field(
-        name="Pressure",
-        value=f"{meta['pushes']} pushes · {meta['nag_ignored'] + session_nag_count} ignored",
+    color = (
+        0xE74C3C if pressure > 6 else 0xE67E22 if pressure > 2
+        else 0xF1C40F if pressure else 0x95A5A6
     )
+    embed = discord.Embed(title=name[:256], description=text[:4096], color=color)
+
+    due_raw = e["start"].get("dateTime") or e["start"].get("date", "")
+    due_str = due_raw[:10]
+    try:
+        due = datetime.date.fromisoformat(due_raw[:10])
+        late = (datetime.datetime.now(TORONTO_TZ).date() - due).days
+        due_str = f"{due:%b} {due.day}"
+        if late > 0:
+            due_str += f" · {late}d late"
+    except ValueError:
+        pass
+    embed.add_field(name="Due", value=due_str)
+    embed.add_field(name="Project", value=str(meta.get("project") or "—")[:1024])
+    embed.add_field(name="Priority", value=str(meta.get("priority") or "—")[:1024])
+    footer = f"{pushes} push{'es' if pushes != 1 else ''} · {ignored} ignored"
+    if short:
+        footer = f"{short} · {footer}"
+    embed.set_footer(text=footer)
     return embed
 
 
@@ -1307,6 +1329,24 @@ def run_belki_sync(project_override: str = None) -> tuple[str, int, int, int, st
     )
 
 
+def scheduled_sync_digest(text: str) -> str:
+    """Strips status noise from an *automatic* sync DM (manual `sync belki`
+    still gets the full report). Blocked/parked listings, description-only
+    reconciles and the "nothing new to schedule" line restate standing state
+    every cycle and went unread; only real changes are worth a ping."""
+    kept = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if (
+            s.startswith(("⛔ [", "🅿️ ["))
+            or (s.startswith("🔄") and s.endswith("— description updated"))
+            or s.startswith("Nothing new to schedule")
+        ):
+            continue
+        kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 async def dm_sync_result(
     text: str, imported: int, completed: int, reconciled: int, status: str
 ):
@@ -1321,7 +1361,9 @@ async def dm_sync_result(
     nothing distinguished that from a quiet day.
     """
     if imported or completed or reconciled:
-        await dm_user(text)
+        digest = scheduled_sync_digest(text)
+        if digest:
+            await dm_user(digest)
     elif status in belki_import.DEGRADED_STATUSES and not already_ran_today(
         "[SYNC-DEGRADED]"
     ):
