@@ -1256,6 +1256,10 @@ async def weekly_queue_summary():
     if report:
         lines.append("")
         lines.extend(report)
+    grade = ledger.grade_line()
+    if grade:
+        lines.append("")
+        lines.append(grade)
     retro = ledger.retro_lines()
     if retro:
         lines.append("")

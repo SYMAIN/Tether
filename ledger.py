@@ -612,3 +612,90 @@ def retro_lines(min_rows: int = 5) -> list[str]:
 if __name__ == "__main__":
     init_db()
     print("\n".join(retro_lines()))
+
+
+# --- GLOBAL GRADE ---
+# One running score (0-100) replayed from task_events, so nothing extra is
+# stored and existing history counts from day one. Pushes and ignored-nag
+# days chip it down; completions earn it back; every day it drifts a little
+# toward GRADE_BASELINE so an old bad week fades instead of pinning an F
+# forever. Reporting only — never feeds scheduling or nag cadence.
+GRADE_BASELINE = 80.0
+GRADE_DRIFT = 0.05          # fraction of the gap to baseline closed per day
+GRADE_PUSH_BASE = 3.0       # nth push on the same task costs base * n ...
+GRADE_PUSH_MAX = 9.0        # ... capped here
+GRADE_NAG_DAY = 2.0         # per task per day its nags went ignored
+GRADE_NAG_DAY_CAP = 6.0     # total ignored-nag cost in one day
+GRADE_COMPLETE = 4.0
+GRADE_ON_TIME_BONUS = 2.0
+
+_LETTERS = [(93, "A"), (90, "A-"), (87, "B+"), (83, "B"), (80, "B-"),
+            (77, "C+"), (73, "C"), (70, "C-"), (67, "D+"), (60, "D")]
+
+
+def grade_letter(score: float) -> str:
+    for floor, letter in _LETTERS:
+        if score >= floor:
+            return letter
+    return "F"
+
+
+def replay_grade(rows: list[tuple], as_of: datetime.date) -> float:
+    """rows: (ts, action, task_name, due_date) in ts order. Pure."""
+    score = GRADE_BASELINE
+    if not rows:
+        return score
+    pushes: dict[str, int] = {}
+    by_day: dict[str, list] = {}
+    for r in rows:
+        by_day.setdefault(r[0][:10], []).append(r)
+    day = datetime.date.fromisoformat(rows[0][0][:10])
+    while day <= as_of:
+        score += (GRADE_BASELINE - score) * GRADE_DRIFT
+        nag_cost = 0.0
+        for ts, action, name, due in by_day.get(day.isoformat(), []):
+            key = (name or "").lower()
+            if action == "pushed":
+                pushes[key] = pushes.get(key, 0) + 1
+                score -= min(GRADE_PUSH_BASE * pushes[key], GRADE_PUSH_MAX)
+            elif action == "nag_ignored":
+                nag_cost += GRADE_NAG_DAY
+            elif action == "completed":
+                score += GRADE_COMPLETE
+                if due and ts[:10] <= due:
+                    score += GRADE_ON_TIME_BONUS
+                pushes.pop(key, None)
+        score -= min(nag_cost, GRADE_NAG_DAY_CAP)
+        score = max(0.0, min(100.0, score))
+        day += datetime.timedelta(days=1)
+    return score
+
+
+def _grade_rows() -> list[tuple]:
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT ts, action, task_name, due_date FROM task_events "
+            "WHERE action IN ('pushed','nag_ignored','completed') "
+            "AND origin IS NOT 'backfill' ORDER BY ts"
+        ).fetchall()
+
+
+def grade_line() -> str | None:
+    """`🎓 Grade: B- (81) ▼4 this week — 3 pushes · 2 ignored-nag days · 4 done`"""
+    try:
+        rows = _grade_rows()
+    except Exception as e:
+        _log(f"[LEDGER] grade failed: {e}")
+        return None
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    now = replay_grade(rows, today)
+    week_ago = replay_grade(rows, today - datetime.timedelta(days=7))
+    delta = round(now) - round(week_ago)
+    arrow = f"▲{delta}" if delta > 0 else f"▼{-delta}" if delta < 0 else "±0"
+    since = (today - datetime.timedelta(days=6)).isoformat()
+    recent = [r for r in rows if r[0][:10] >= since]
+    n = {a: sum(1 for r in recent if r[1] == a) for a in ("pushed", "nag_ignored", "completed")}
+    return (
+        f"🎓 **Grade: {grade_letter(now)}** ({round(now)}) {arrow} this week — "
+        f"{n['pushed']} pushes · {n['nag_ignored']} ignored-nag days · {n['completed']} done"
+    )
