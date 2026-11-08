@@ -18,6 +18,8 @@ import time
 
 import pytz
 
+from display import fmt_times, short_title
+
 TORONTO_TZ = pytz.timezone("America/Toronto")
 DEADLINE_PREFIX = "⏰"
 DB_PATH = os.environ.get("LEDGER_DB", "data/ledger.db")
@@ -590,22 +592,24 @@ def retro_lines(min_rows: int = 5) -> list[str]:
         _log(f"[LEDGER] retro failed: {e}")
         return []
     if total < min_rows:
-        return ["📈 History: not enough data yet."]
+        # Silence, not "not enough data yet": a line that says nothing is one
+        # more line to read past every Sunday.
+        return []
 
     lines = []
     wc = weekly_counts(7)
     lines.append(
-        f"📈 **Last 7 days:** {wc.get('created', 0)} created · "
-        f"{wc.get('completed', 0)} completed · {wc.get('pushed', 0)} pushes"
+        f"Last 7 days: {wc.get('created', 0)} added, "
+        f"{wc.get('completed', 0)} done, {wc.get('pushed', 0)} push(es)"
     )
     rate = on_time_rate(30)
     if rate:
         on, tot = rate
-        lines.append(
-            f"**On-time (30d):** {round(100 * on / tot)}% ({on}/{tot} done by their due date)"
-        )
+        lines.append(f"On time: {round(100 * on / tot)}% over 30 days ({on} of {tot})")
     for name, reason, count in recurring_reasons():
-        lines.append(f'⚠️ **{name}** pushed {count}× citing "{reason}" — re-scope or drop.')
+        lines.append(
+            f'💬 {short_title(name)} pushed {fmt_times(count)} for "{reason}" — park it?'
+        )
     return lines
 
 
@@ -680,8 +684,25 @@ def _grade_rows() -> list[tuple]:
         ).fetchall()
 
 
+def format_grade_line(
+    now: float, week_ago: float, pushes: int, nags: int, done: int
+) -> str:
+    """`🎓 B- (81), down 4 this week — 3 pushes, 2 days of ignored nags, 4 done`.
+
+    Pure and separate from grade_line() so the wording can be tested without
+    a database, a clock or a replay window. "down 4" rather than "▼4": the
+    arrow needs a legend, the words don't.
+    """
+    delta = round(now) - round(week_ago)
+    change = f"up {delta}" if delta > 0 else f"down {-delta}" if delta < 0 else "no change"
+    return (
+        f"🎓 {grade_letter(now)} ({round(now)}), {change} this week — "
+        f"{pushes} push{'es' if pushes != 1 else ''}, "
+        f"{nags} day{'s' if nags != 1 else ''} of ignored nags, {done} done"
+    )
+
+
 def grade_line() -> str | None:
-    """`🎓 Grade: B- (81) ▼4 this week — 3 pushes · 2 ignored-nag days · 4 done`"""
     try:
         rows = _grade_rows()
     except Exception as e:
@@ -690,12 +711,7 @@ def grade_line() -> str | None:
     today = datetime.datetime.now(TORONTO_TZ).date()
     now = replay_grade(rows, today)
     week_ago = replay_grade(rows, today - datetime.timedelta(days=7))
-    delta = round(now) - round(week_ago)
-    arrow = f"▲{delta}" if delta > 0 else f"▼{-delta}" if delta < 0 else "±0"
     since = (today - datetime.timedelta(days=6)).isoformat()
     recent = [r for r in rows if r[0][:10] >= since]
     n = {a: sum(1 for r in recent if r[1] == a) for a in ("pushed", "nag_ignored", "completed")}
-    return (
-        f"🎓 **Grade: {grade_letter(now)}** ({round(now)}) {arrow} this week — "
-        f"{n['pushed']} pushes · {n['nag_ignored']} ignored-nag days · {n['completed']} done"
-    )
+    return format_grade_line(now, week_ago, n["pushed"], n["nag_ignored"], n["completed"])

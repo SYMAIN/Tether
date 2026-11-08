@@ -83,6 +83,7 @@ import json
 import os
 import re
 
+import display
 import ledger
 from ledger import clean_name
 from short_names import derive_short, find_collisions
@@ -536,10 +537,10 @@ def allocate_evenings(
     # allocated and then silently evaporates. Round each slice up to a
     # spendable size in share order until the week runs out; whoever no
     # longer fits waits for a week where they do.
+    starved: list[str] = []
     if min_units:
         rebuilt: dict[str, int] = {}
         budget = capacity
-        starved: list[str] = []
         for k in sorted(alloc, key=lambda k: (-alloc[k], -required.get(k, 0), k)):
             unit = min_units.get(k) or 1
             take = min(max(alloc[k], unit), eligible[k]["remaining"], budget)
@@ -547,11 +548,7 @@ def allocate_evenings(
                 rebuilt[k] = take
                 budget -= take
             else:
-                starved.append(f"{k} (next task needs {unit} ev)")
-        if starved:
-            lines.append(
-                "⏸ No room this week for: " + ", ".join(sorted(starved)) + "."
-            )
+                starved.append(k)
         # Evenings freed by a project that couldn't use them go back to the
         # projects that can, rather than sitting idle for the week.
         while budget > 0 and rebuilt:
@@ -570,23 +567,25 @@ def allocate_evenings(
     committed = sum(required.values())
     if committed > capacity:
         lines.append(
-            f"⚠️ Deadlines commit you to **{committed:.1f} evenings/week** against a "
-            f"capacity of {capacity}. Something slips — move a date in `projects.md` "
-            f"or cut scope."
+            f"⚠️ Your project deadlines need about {committed:.0f} evenings a week, "
+            f"but you have {capacity}. Move a date in projects.md or cut scope."
         )
     if overdue:
-        lines.append(f"🔴 Past its project deadline: {', '.join(sorted(overdue))}.")
+        lines.append(f"🔴 Past its deadline: {', '.join(sorted(overdue))}.")
     if unregistered:
         lines.append(
-            '❓ Not in projects.md, treated as active: '
-            + ', '.join(sorted(unregistered)) + '.'
+            "❓ Not in projects.md (scheduled anyway): "
+            + ", ".join(sorted(unregistered)) + "."
         )
-    for name in sorted(alloc, key=lambda k: (-alloc[k], k)):
-        info = eligible[name]
-        due_note = f" · due {info['due']}" if info["due"] else ""
+    # One line for the week's plan; project names only. The per-project
+    # "N ev this week, M left · due X" bullets were four columns of bookkeeping
+    # to answer "what am I working on this week".
+    if alloc:
         lines.append(
-            f"• **{name}** — {alloc[name]} ev this week, {info['remaining']} left{due_note}"
+            "🗓️ This week: " + ", ".join(sorted(alloc, key=lambda k: (-alloc[k], k)))
         )
+    if starved:
+        lines.append("Not this week: " + ", ".join(sorted(starved)))
     return alloc, lines
 
 
@@ -960,7 +959,8 @@ def sync(
         # doesn't just silently vanish from the sync reply — it's still an
         # open Belki task, it's just not this week's to schedule.
         blocked_lines = [
-            f'⛔ [{t["project"]}] {t["name"]} — waiting on "{t["blocked_by"]["name"]}"'
+            f'⛔ [{t["project"]}] {display.short_title(t["name"], t["project"])} — '
+            f'waiting on "{display.short_title(t["blocked_by"]["name"], t["blocked_by"]["project"])}"'
             for t in tasks
             if t["project"]
             and not t["done"]
@@ -968,7 +968,7 @@ def sync(
             and t["name"].lower() not in done_names
             and t.get("blocked_by")
         ] + [
-            f'🅿️ [{t["project"]}] {t["name"]} — parked'
+            f'🅿️ [{t["project"]}] {display.short_title(t["name"], t["project"])} — parked'
             for t in tasks
             if t["project"]
             and not t["done"]
@@ -1160,7 +1160,10 @@ def sync(
                 if priority_changed:
                     bits.append(f"priority set to {t['priority']}")
                 icon = "🔧" if (needs_id or needs_project) else "🔄"
-                reconciled_lines.append(f"{icon} {t['name']} — {', '.join(bits)}")
+                reconciled_lines.append(
+                    f"{icon} {display.short_title(t['name'], t['project'])} — "
+                    f"{', '.join(bits)}"
+                )
 
         # Persist freed evenings now, not only in the end-of-sync write below —
         # that write is skipped whenever nothing new gets imported this cycle
@@ -1177,7 +1180,6 @@ def sync(
         # in says nothing about how urgent it is.
         # A project already holding evenings in the target week has that counted
         # against its budget, so a mid-week sync tops up rather than doubling.
-        week_key = week.isoformat()
         new_tasks: list[tuple[dict, str]] = []
         for pname in sorted(alloc, key=lambda p: (-alloc[p], p)):
             used = spent.get(pname, 0)
@@ -1249,7 +1251,13 @@ def sync(
         if blocked_lines:
             lines.extend(blocked_lines)
             lines.append("")
-        lines.append(f"📥 Scheduled {len(new_tasks)} task(s) for the week of {week_key}:")
+        lines.append(
+            f"{len(new_tasks)} task{'s' if len(new_tasks) != 1 else ''} lined up:"
+        )
+        # Only tag the project when the week's imports span more than one —
+        # otherwise "• Tether — Fix the nag loop" repeats what the line above
+        # already said for every single task.
+        multi_project = len({p for _, p in new_tasks}) > 1
 
         imported = 0
         for t, pname in new_tasks:
@@ -1258,13 +1266,10 @@ def sync(
             # dependency order) is preserved; a task with no estimate fills its
             # whole week.
             need = _need(t)
-            note = ""
-            if is_fixed(t):
+            fixed = is_fixed(t)
+            if fixed:
                 due = t["due"]
-                note = " (fixed due date from Belki)"
             else:
-                if t["due"]:
-                    note = " (listed due date already passed — repacked)"
                 while not _fits(usage.get(slot.isoformat(), 0), need):
                     slot += datetime.timedelta(days=7)
                 due = slot.isoformat()
@@ -1288,16 +1293,27 @@ def sync(
                 )
                 continue
             imported += 1
-            est_note = (
-                f" (est: {t['estimate']} evening{'s' if t['estimate'] != 1 else ''})"
+            est = (
+                f"{t['estimate']} evening{'s' if t['estimate'] != 1 else ''}"
                 if t["estimate"] is not None
-                else " (no estimate — fills its week)"
+                else "fills the week"
             )
-            lines.append(f"• [{pname}] {t['name']} — due {due}{est_note}{note}")
+            # A date only when Belki pinned one: a packed task's date is this
+            # week by construction, and printing the same week-ending Sunday on
+            # every line is noise.
+            due_note = (
+                f" · due {display.fmt_date(datetime.date.fromisoformat(due), today)}"
+                if fixed
+                else ""
+            )
+            tag = f"{pname} — " if multi_project else ""
+            lines.append(
+                f"• {tag}{display.short_title(t['name'], pname)} · {est}{due_note}"
+            )
             if t["estimate"] is not None and t["estimate"] > EVENINGS_PER_WEEK:
                 lines.append(
-                    f"  ⚠️ estimated {t['estimate']} evenings exceeds your weekly capacity "
-                    f"of {EVENINGS_PER_WEEK} — consider splitting it in Belki."
+                    f"  ⚠️ {t['estimate']} evenings is more than a whole week — "
+                    f"split it in Belki."
                 )
 
         # Record the spend against the week. Without this the next sync would

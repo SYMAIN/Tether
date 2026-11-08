@@ -1,5 +1,5 @@
 import datetime
-from ledger import replay_grade, grade_letter, GRADE_BASELINE
+from ledger import format_grade_line, replay_grade, grade_letter, GRADE_BASELINE
 
 D = datetime.date(2026, 11, 1)
 
@@ -40,3 +40,21 @@ def test_floor_and_letters():
     rows = [row("2026-11-01", "pushed")] * 50
     assert replay_grade(rows, D) == 0
     assert grade_letter(95) == "A" and grade_letter(80) == "B-" and grade_letter(10) == "F"
+
+
+def test_grade_line_down_week():
+    assert format_grade_line(81.4, 85.0, 3, 2, 4) == (
+        "🎓 B- (81), down 4 this week — 3 pushes, 2 days of ignored nags, 4 done"
+    )
+
+
+def test_grade_line_up_week_pluralises_correctly():
+    assert format_grade_line(86.0, 84.4, 1, 1, 1) == (
+        "🎓 B (86), up 2 this week — 1 push, 1 day of ignored nags, 1 done"
+    )
+
+
+def test_grade_line_flat_week():
+    assert format_grade_line(80.2, 80.4, 0, 0, 0) == (
+        "🎓 B- (80), no change this week — 0 pushes, 0 days of ignored nags, 0 done"
+    )

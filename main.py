@@ -16,6 +16,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 import belki_import
+import display
 import ledger
 from ledger import clean_name, infer_complexity, complexity_label, belki_priority_weight
 from short_names import derive_short, normalize_query, button_custom_id
@@ -857,14 +858,47 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
+def chunk_message(message: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Splits a DM on line boundaries, hard-slicing only an over-long line.
+
+    Discord hard-rejects anything over 2000 chars, and a raise here loses the
+    whole message (the caller's job is already half-done by then) — so the
+    message does have to be cut. Cutting at a fixed character offset instead of
+    a newline split words in half ("...the re" / "st of the...") and landed
+    mid-markdown, which is how "`@Tether push oracin87`" arrived as
+    "`@Tether push ora" plus an unclosed backtick.
+    """
+    chunks: list[str] = []
+    current = ""
+    for line in (message or "").split("\n"):
+        if len(line) > limit:
+            # One line too long to ever fit: flush what's pending, then slice
+            # it, keeping a short tail as the buffer for the next lines.
+            if current:
+                chunks.append(current)
+                current = ""
+            for i in range(0, len(line), limit):
+                piece = line[i : i + limit]
+                if len(piece) == limit:
+                    chunks.append(piece)
+                else:
+                    current = piece
+            continue
+        candidate = line if not current else f"{current}\n{line}"
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            chunks.append(current)
+            current = line
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def dm_user(message: str):
-    # Discord hard-rejects anything over 2000 chars, and a raise here loses the
-    # whole message (the caller's job is already half-done by then). Slice into
-    # 2000-char chunks like the @Tether reply paths do, so a long nag/briefing
-    # arrives complete across several DMs instead of not at all.
     user = await bot.fetch_user(DISCORD_USER_ID)
-    for i in range(0, len(message), DISCORD_MESSAGE_LIMIT):
-        await user.send(message[i : i + DISCORD_MESSAGE_LIMIT])
+    for chunk in chunk_message(message):
+        await user.send(chunk)
     log(f"[DM] {message[:200]}")
 
 
@@ -1155,52 +1189,161 @@ async def midnight_nag_persist():
 
 
 # --- SCHEDULED JOBS ---
-async def morning_briefing():
-    today = datetime.datetime.now(TORONTO_TZ).date()
-    overdue = get_overdue_tether_events()
-    overdue_lines = []
-    for e in overdue:
-        overdue_lines.append(f"• ⚠️ {task_label(e)} — OVERDUE")
+def _due_date(event: dict) -> datetime.date | None:
+    try:
+        return datetime.date.fromisoformat(event["start"]["dateTime"][:10])
+    except (KeyError, TypeError, ValueError):
+        return None
 
-    all_events = list_upcoming_events(20)
+
+def _brief_label(event: dict) -> str:
+    """`Fix ability-spam (abilqueu)` — short title plus the handle to type back.
+
+    The handle matters more than the title does: it's the token Simon replies
+    with, so it survives the shortening.
+    """
+    project = (parse_meta(event).get("project") or "").strip() or None
+    name = display.short_title(clean_name(event.get("summary", "")), project)
+    short = event_short(event)
+    return f"{name} ({short})" if short else name
+
+
+def _brief_event(event: dict) -> str:
+    """`Church 2:30–3:30pm`, `Gym 6–7pm` — a fixed event on today's line."""
+    summary = event.get("summary", "")
+    start = (event.get("start", {}) or {}).get("dateTime", "")[11:16]
+    if not start:
+        return summary
+    end = (event.get("end", {}) or {}).get("dateTime", "")[11:16] or start
+    start_label = display.fmt_time(start)
+    end_label = display.fmt_time(end)
+    # Say the meridiem once when both ends share it ("6–7pm", not "6pm–7pm").
+    if end_label[-2:] in ("am", "pm") and start_label.endswith(end_label[-2:]):
+        start_label = start_label[:-2]
+    return f"{summary} {start_label}–{end_label}"
+
+
+async def morning_briefing(weekly: bool = False):
+    """One DM: what's late, what's on today, what to do tonight.
+
+    Replaces three separate messages (overdue list, deadline warnings, morning
+    header) that each restated a piece of the same picture at 09:00. `weekly`
+    appends the week's deadline list and the ledger's retro, and is what
+    Sunday's job sends.
+    """
+    today = datetime.datetime.now(TORONTO_TZ).date()
+    lines = [f"☀️ {today:%A}, {today:%b} {today.day}"]
+
+    overdue = get_overdue_tether_events()
+    if overdue:
+        lines.append("Overdue: " + ", ".join(_brief_label(e) for e in overdue))
+
+    # Tether's own ⏰ events are listed below as work, not as calendar entries —
+    # an event whose summary merely starts with the prefix is the queue talking
+    # to itself.
     today_events = [
         e
-        for e in all_events
-        if e.get("start", {}).get("dateTime", "").startswith(str(today))
+        for e in list_upcoming_events(20)
+        if not e.get("summary", "").startswith(DEADLINE_PREFIX)
+        and e.get("start", {}).get("dateTime", "").startswith(today.isoformat())
     ]
-    cal_lines = []
-    for e in today_events:
-        start = e["start"]["dateTime"][11:16]
-        end = e["end"]["dateTime"][11:16]
-        cal_lines.append(f"• {start}–{end} {e['summary']}")
+    if today_events:
+        lines.append("Today: " + ", ".join(_brief_event(e) for e in today_events))
+    else:
+        lines.append("Today: nothing on the calendar")
 
     deadlines = get_tether_deadlines()
-    next_line = ""
-    if deadlines:
-        top = rank_deadlines(deadlines)[0]
-        name = task_label(top)
-        reason = priority_reason(top)
-        # Which project it belongs to matters now that the queue holds several.
-        tag = parse_meta(top).get("project")
-        label = f"[{tag}] {name}" if tag else name
-        next_line = f"**Next up:** {label} — {reason}."
+    focus = rank_deadlines(deadlines)[0] if deadlines else None
+    if focus:
+        due = _due_date(focus)
+        when = display.fmt_date(due, today) if due else "soon"
+        lines.append(f"🎯 Focus: {_brief_label(focus)} — due {when}")
 
-    lines = ["📅 **Morning briefing**\n"]
-    if overdue_lines:
-        lines.append("**Overdue:**")
-        lines.extend(overdue_lines)
+    # The old deadline_warning() DM fired separately for everything due in the
+    # next 24h; folding it in here is the point of the rewrite — one message
+    # that says the same thing, next to the task it's about.
+    also: dict[datetime.date, list] = {}
+    for e in deadlines:
+        if e is focus:
+            continue
+        due = _due_date(e)
+        if due in (today, today + datetime.timedelta(days=1)):
+            also.setdefault(due, []).append(e)
+    for due in sorted(also):
+        lines.append(
+            f"⏰ Also due {display.fmt_date(due, today)}: "
+            + ", ".join(_brief_label(e) for e in also[due])
+        )
+
+    if weekly:
         lines.append("")
-    if cal_lines:
-        lines.append("**Today's schedule:**")
-        lines.extend(cal_lines)
+        lines.extend(weekly_section())
+    grade = ledger.grade_line()
+    if grade:
         lines.append("")
-    else:
-        lines.append("**Today's schedule:** Nothing on the calendar.")
-        lines.append("")
-    if next_line:
-        lines.append(next_line)
+        lines.append(grade)
+    if weekly:
+        lines.extend(ledger.retro_lines())
 
     await dm_user("\n".join(lines))
+    # already_ran_today() dedups these jobs by searching the log for these
+    # exact words, and the header above no longer contains them — without
+    # these lines the briefing would resend on every restart.
+    log("[JOB] Morning briefing sent")
+    if weekly:
+        log("[JOB] Weekly Queue sent")
+
+
+def weekly_section() -> list[str]:
+    """The week's deadlines, grouped by date and project, one line each.
+
+    Sorted by date rather than by priority_score: this is the "what does the
+    week look like" view, and the focus pick above already answers "what now".
+    """
+    deadlines = get_tether_deadlines()
+    if not deadlines:
+        return ["Coming up: queue is empty."]
+    today = datetime.datetime.now(TORONTO_TZ).date()
+
+    groups: dict[tuple[str, str], list] = {}
+    for e in deadlines:
+        due = (e.get("start", {}) or {}).get("dateTime", "")[:10]
+        if not due:
+            continue
+        project = (parse_meta(e).get("project") or "").strip()
+        groups.setdefault((due, project), []).append(e)
+    if not groups:
+        return ["Coming up: queue is empty."]
+
+    lines = ["Coming up"]
+    for due, project in sorted(groups):
+        events = groups[(due, project)]
+        date_label = due
+        try:
+            date_label = display.fmt_date(datetime.date.fromisoformat(due), today)
+        except ValueError:
+            pass
+        # Four cards from one project landing the same day is one fact about
+        # the week, not four lines saying "and another one".
+        if len(events) > 1:
+            label = f"{len(events)} {project} tasks" if project else f"{len(events)} tasks"
+            lines.append(f"• {date_label} — {label}")
+            continue
+        e = events[0]
+        meta = parse_meta(e)
+        line = (
+            f"• {date_label} — "
+            f"{display.short_title(clean_name(e.get('summary', '')), project or None)}"
+        )
+        short = event_short(e)
+        if short:
+            line += f" ({short})"
+        if meta["pushes"] > 0:
+            line += f", pushed {display.fmt_times(meta['pushes'])}"
+        if (meta.get("priority") or "").strip().upper() == "P1":
+            line += " ⚠️ P1"
+        lines.append(line)
+    return lines
 
 
 async def eod_sweep():
@@ -1225,46 +1368,21 @@ async def deadline_warning():
 
 
 async def weekly_queue_summary():
-    deadlines = get_tether_deadlines()
-    if not deadlines:
-        await dm_user("📋 **Weekly Queue** — No deadlines in the queue. You're clear.")
-        return
-    ranked = rank_deadlines(deadlines)
-    lines = ["📋 **Weekly Queue** _(by priority)_:\n"]
-    for i, e in enumerate(ranked):
-        name = task_label(e)
-        date_str = e["start"]["dateTime"][:10]
-        meta = parse_meta(e)
-        if meta.get("project"):
-            name = f"[{meta['project']}] {name}"
-        pushes = meta["pushes"]
-        desc = e.get("description", "") or ""
-        orig_match = re.search(r"Originally due: (\d{4}-\d{2}-\d{2})", desc)
-        suffix = ""
-        if pushes > 0:
-            suffix = f" _(pushed {pushes}×"
-            if orig_match:
-                suffix += f", originally {orig_match.group(1)}"
-            suffix += ")_"
-        prefix = "🔴" if i == 0 else "•"
-        lines.append(f"{prefix} {name} — due {date_str}{suffix}")
-    try:
-        report = belki_import.project_report()
-    except Exception as e:
-        log(f"[SYNC] project report failed: {e}")
-        report = []
-    if report:
-        lines.append("")
-        lines.extend(report)
+    """Sunday's queue review — the fallback job when MORNING_BRIEFING_ENABLED
+    is false (otherwise the Sunday briefing carries this same section).
+
+    The per-project "N ev open · due X ⚠️ AT RISK" block is gone: `ev` isn't a
+    unit Simon reads, and the deadline pressure it restated is already the
+    first line of weekly_section().
+    """
+    lines = list(weekly_section())
     grade = ledger.grade_line()
+    lines.append("")
     if grade:
-        lines.append("")
         lines.append(grade)
-    retro = ledger.retro_lines()
-    if retro:
-        lines.append("")
-        lines.extend(retro)
+    lines.extend(ledger.retro_lines())
     await dm_user("\n".join(lines))
+    log("[JOB] Weekly Queue sent")
 
 
 async def inactivity_check():
@@ -1382,7 +1500,6 @@ async def run_morning_jobs():
     if already_ran_today("Morning briefing"):
         return
     await morning_briefing()
-    await deadline_warning()
     try:
         await dm_sync_result(*run_belki_sync())
     except Exception as e:
@@ -1390,9 +1507,13 @@ async def run_morning_jobs():
 
 
 async def run_sunday_morning():
-    await run_morning_jobs()
-    if not already_ran_today("Weekly Queue"):
-        await weekly_queue_summary()
+    if already_ran_today("Morning briefing"):
+        return
+    await morning_briefing(weekly=True)
+    try:
+        await dm_sync_result(*run_belki_sync())
+    except Exception as e:
+        log(f"[SYNC] morning Belki sync failed: {e}")
 
 
 # --- PUSH VALIDATION ---
