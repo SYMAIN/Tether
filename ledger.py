@@ -630,8 +630,8 @@ GRADE_PUSH_BASE = 3.0       # nth push on the same task costs base * n ...
 GRADE_PUSH_MAX = 9.0        # ... capped here
 GRADE_NAG_DAY = 2.0         # per task per day its nags went ignored
 GRADE_NAG_DAY_CAP = 6.0     # total ignored-nag cost in one day
-GRADE_COMPLETE = 4.0
-GRADE_ON_TIME_BONUS = 2.0
+GRADE_COMPLETE = 3.0
+GRADE_ON_TIME_BONUS = 1.0
 
 _LETTERS = [(93, "A"), (90, "A-"), (87, "B+"), (83, "B"), (80, "B-"),
             (77, "C+"), (73, "C"), (70, "C-"), (67, "D+"), (60, "D")]
@@ -665,9 +665,14 @@ def replay_grade(rows: list[tuple], as_of: datetime.date) -> float:
             elif action == "nag_ignored":
                 nag_cost += GRADE_NAG_DAY
             elif action == "completed":
-                score += GRADE_COMPLETE
-                if due and ts[:10] <= due:
-                    score += GRADE_ON_TIME_BONUS
+                gain = GRADE_COMPLETE + (
+                    GRADE_ON_TIME_BONUS if due and ts[:10] <= due else 0
+                )
+                # Gains shrink as the score nears 100 (full value at the
+                # baseline, nothing at 100). Tuned 2026-11-08 against the VM
+                # ledger: flat +4/+2 sat at 100 for 51 of 125 days, so a
+                # normal week of completions erased every push and nag.
+                score += gain * max(0.0, (100 - score) / (100 - GRADE_BASELINE))
                 pushes.pop(key, None)
         score -= min(nag_cost, GRADE_NAG_DAY_CAP)
         score = max(0.0, min(100.0, score))

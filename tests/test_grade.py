@@ -58,3 +58,8 @@ def test_grade_line_flat_week():
     assert format_grade_line(80.2, 80.4, 0, 0, 0) == (
         "🎓 B- (80), no change this week — 0 pushes, 0 days of ignored nags, 0 done"
     )
+
+
+def test_completions_approach_but_never_pin_the_ceiling():
+    rows = [row("2026-11-01", "completed", f"t{i}", "2026-11-02") for i in range(30)]
+    assert 95 < replay_grade(rows, D) < 100
