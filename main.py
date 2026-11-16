@@ -36,7 +36,10 @@ LOG_FILE = "tether.log"
 MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    # gemini-2.0-flash dropped 2026-11-15: 404 "no longer available". It was
+    # the last entry, so its 404 was the only error that ever got logged,
+    # masking why the earlier models failed.
+    "gemini-3.8-flash",
 ]
 
 CONFIDENCE_THRESHOLD = 0.7
@@ -758,6 +761,7 @@ def parse_intent_with_fallback(user_message: str) -> tuple[dict, str]:
         try:
             return parse_intent(user_message, model), model
         except Exception as e:
+            log(f"[INTENT] {model} failed: {str(e)[:300]}")
             last_error = e
             continue
     raise last_error or Exception(
@@ -834,6 +838,7 @@ def send_with_fallback(chat, user_id: int, message_content: str):
             response = chat.send_message(message_content)
             return response, MODELS[i]
         except Exception as e:
+            log(f"[SCHEDULER] {MODELS[i]} failed: {str(e)[:300]}")
             last_error = e
             continue
     raise last_error or Exception(
