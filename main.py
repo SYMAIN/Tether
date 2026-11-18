@@ -175,15 +175,23 @@ def get_calendar_service():
 
 
 _service = None
+_service_built_at = 0.0
+# The cached httplib2 connection goes stale on the idle VM (every call then
+# raises [Errno 32] Broken pipe). Only run_belki_sync had a retry, so reactive
+# commands like "next task?" failed until the next nag cycle reset it. Rebuilding
+# after a short TTL covers every caller; the nag/briefing cadence is far longer
+# than this, so each job still gets a fresh connection.
+SERVICE_TTL_SECONDS = 120
 
 
 def get_service():
     # Lazy init: module-level init crashed the bot before Discord connected
     # when credentials were missing, and cached a service that outlived token
     # expiry (see 462dded).
-    global _service
-    if _service is None:
+    global _service, _service_built_at
+    if _service is None or time.time() - _service_built_at > SERVICE_TTL_SECONDS:
         _service = get_calendar_service()
+        _service_built_at = time.time()
     return _service
 
 
