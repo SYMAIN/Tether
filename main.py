@@ -686,7 +686,12 @@ def nag_summary_header(nag_count: int) -> str:
 
 
 # --- INTENT PARSER ---
-gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+# Pin v1beta: system_instruction / function-calling tools are rejected on the
+# SDK's newer default (v1) with 400 "Developer instruction is not enabled".
+gemini_client = genai.Client(
+    api_key=os.environ.get("GEMINI_API_KEY"),
+    http_options=types.HttpOptions(api_version="v1beta"),
+)
 
 with open("agent.md", "r", encoding="utf-8") as f:
     AGENT_INSTRUCTIONS = f.read()
